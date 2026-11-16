@@ -132,9 +132,56 @@ def test_hold_writes_no_allocation(client):
     pdf = invoice_pdf(number="HCI-0043", lines=(("CAL-STD", "Standard calibration", "30", "$250.00", "$7,500.00"),),
                       subtotal="$7,500.00", total="$7,500.00")
     run = wait_for(client, _upload(client, pdf).json()["run_id"])
-    assert run["decision"] == "HOLD" and run["reason_code"] == "QUANTITY_EXCEEDS_PO"
+    assert run["decision"] == "HOLD" and run["reason_code"] == "AMOUNT_EXCEEDS_PO"
+    assert run["decision_detail"]["reason_codes"] == ["AMOUNT_EXCEEDS_PO", "QUANTITY_EXCEEDS_PO"]
     assert run["allocation_id"] is None
     assert client.get("/ledger").json()["allocation_count"] == 0
+
+
+def _cal_std_invoice(number: str, qty: int) -> bytes:
+    amount = f"${qty * 250:,}.00"
+    return invoice_pdf(number=number, lines=(("CAL-STD", "Standard calibration", str(qty), "$250.00", amount),),
+                       subtotal=amount, total=amount)
+
+
+def test_cumulative_overbilling_across_two_invoices(client):
+    """Two distinct invoice numbers that each fit the fresh PO but together exceed both the
+    quantity cap (24 units of CAL-STD) and the money caps (line 6,000.00; PO total 6,960.00)."""
+    _import(client)
+    first = wait_for(client, _upload(client, _cal_std_invoice("HCI-1001", 14)).json()["run_id"])
+    assert first["decision"] == "READY" and first["gross_cents"] == 350000
+
+    second = wait_for(client, _upload(client, _cal_std_invoice("HCI-1002", 14)).json()["run_id"])
+    assert second["decision"] == "HOLD" and second["reason_code"] == "AMOUNT_EXCEEDS_PO"
+    assert second["allocation_id"] is None
+    d = second["decision_detail"]
+    assert d["reason_codes"] == ["AMOUNT_EXCEEDS_PO", "QUANTITY_EXCEEDS_PO"]
+    b = {(x["measure"], x["scope"]): x for x in d["authorization"]["breaches"]}
+    assert set(b) == {("quantity", "line"), ("net", "line"), ("net", "po")}
+    assert (b[("net", "line")]["projected"], b[("net", "line")]["excess"]) == (700000, 100000)
+    assert (b[("net", "po")]["authorized"], b[("net", "po")]["previously_allocated"], b[("net", "po")]["remaining"],
+            b[("net", "po")]["incoming"], b[("net", "po")]["projected"], b[("net", "po")]["excess"]) == (
+        696000, 350000, 346000, 350000, 700000, 4000)
+    assert (b[("quantity", "line")]["projected"], b[("quantity", "line")]["excess"]) == ("28", "4")
+    prior = d["authorization"]["prior_invoices"]
+    assert [(p["run_id"], p["invoice_number"], p["invoice_date"]) for p in prior] == [
+        (first["run_id"], "HCI-1001", "2026-03-04")]
+
+    ledger = client.get("/ledger").json()
+    po = next(p for p in ledger["purchase_orders"] if p["po_id"] == "PO-7781")
+    assert ledger["allocation_count"] == 1 and po["remaining_net_cents"] == 346000
+
+    # Retrying finalization of the hold never allocates.
+    r = client.post(f"/runs/{second['run_id']}/finalize").json()
+    assert r["already_finalized"] is True and r["decision"] == "HOLD" and r["allocations_for_run"] == 0
+
+    # The stored explanation is frozen: change the ledger and reopen the hold.
+    with db() as conn:
+        conn.execute("DELETE FROM allocation_lines")
+        conn.execute("DELETE FROM allocations")
+    reopened = client.get(f"/runs/{second['run_id']}").json()
+    assert reopened["decision_detail"] == d
+    assert reopened["po_balance_now"]["remaining_net_cents"] == 696000  # current ledger moved; the hold did not
 
 
 def test_corrupt_pdf_fails_safely_with_retry_path(client):

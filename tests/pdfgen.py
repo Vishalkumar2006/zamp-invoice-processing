@@ -45,11 +45,11 @@ def make_pdf(items: list[Text], width: float = 612, height: float = 792) -> byte
     return bytes(out)
 
 
-def invoice_pdf(*, supplier="Harborline Calibration Inc", number="HCI-0042", date="March 4, 2026",
+def invoice_items(*, supplier="Harborline Calibration Inc", number="HCI-0042", date="March 4, 2026",
                 po="PO-7781", lines=(("CAL-STD", "Standard calibration", "12", "$250.00", "$3,000.00"),
                                      ("CAL-TRV", "Technician travel", "1", "$480.00", "$480.00")),
-                subtotal="$3,480.00", tax="$0.00", total="$3,480.00", currency_label="Amount due (USD)") -> bytes:
-    """A native-text invoice with a layout that differs from the supplied fixtures."""
+                subtotal="$3,480.00", tax="$0.00", total="$3,480.00", currency_label="Amount due (USD)") -> list[Text]:
+    """Layout items for a synthetic invoice (shared by the native and scanned variants)."""
     t: list[Text] = [
         Text(40, 40, supplier, 16, True),
         Text(40, 62, "12 Pier Road, Unit 4"),
@@ -76,7 +76,37 @@ def invoice_pdf(*, supplier="Harborline Calibration Inc", number="HCI-0042", dat
     y += 22
     t += [Text(380, y, currency_label, bold=True), Text(520, y, total, bold=True)]
     t.append(Text(40, 740, "Thank you for your business. Page 1 of 1", 8))
-    return make_pdf(t)
+    return t
+
+
+def invoice_pdf(**kw) -> bytes:
+    """A native-text invoice with a layout that differs from the supplied fixtures."""
+    return make_pdf(invoice_items(**kw))
+
+
+def scan_pdf(items: list[Text], *, dpi: int = 200, angle: float = 0.6, width: float = 612,
+             height: float = 792) -> bytes:
+    """An image-only PDF that looks like a slightly rotated scan of the same layout.
+
+    Text is drawn with the font bundled inside Pillow (not a system font), so the pixels do not
+    depend on which fonts the host has or how Poppler substitutes a non-embedded Helvetica.
+    """
+    import io
+
+    from PIL import Image, ImageDraw, ImageFont
+
+    scale = dpi / 72.0
+    img = Image.new("L", (round(width * scale), round(height * scale)), 255)
+    draw = ImageDraw.Draw(img)
+    for it in items:
+        font = ImageFont.load_default(size=it.size * scale)
+        # Bold is drawn at regular weight: a stroked "fake bold" smears glyphs (OCR read
+        # "Details" as "Detalls"), which is an artefact of the generator, not of real scans.
+        draw.text((it.x * scale, it.y * scale), it.text, fill=0, font=font)
+    img = img.rotate(angle, resample=Image.Resampling.BICUBIC, expand=False, fillcolor=255)
+    buf = io.BytesIO()
+    img.save(buf, "PDF", resolution=dpi)
+    return buf.getvalue()
 
 
 VENDORS_CSV = b"vendor_id,legal_name,status\nV-900,Harborline Calibration Inc,APPROVED\nV-901,Other Supplies LLC,APPROVED\n"

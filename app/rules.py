@@ -66,7 +66,8 @@ def po_balance(snap: Snapshot, po_id: str) -> dict[str, Any]:
 
 def evaluate(inv: ExtractedInvoice, snap: Snapshot, *, min_conf: float, policy_version: str) -> Decision:
     checks: list[dict[str, Any]] = []
-    ctx: dict[str, Any] = {"vendor": None, "po": None, "candidates": [], "prior": []}
+    ctx: dict[str, Any] = {"vendor": None, "po": None, "candidates": [], "prior": [], "authorization": None,
+                           "reason_codes": []}
 
     def check(rule: str, ok: bool, detail: str, **compared: Any) -> bool:
         checks.append({"rule": rule, "status": "pass" if ok else "fail", "detail": detail, "compared": compared})
@@ -90,6 +91,7 @@ def evaluate(inv: ExtractedInvoice, snap: Snapshot, *, min_conf: float, policy_v
             vendor_name=ctx["vendor"]["legal_name"] if ctx["vendor"] else None,
             po_id=ctx["po"]["po_id"] if ctx["po"] else None, candidate_po_ids=ctx["candidates"],
             checks=checks, prior_allocations=ctx["prior"], review_field=stop.review_field,
+            reason_codes=ctx["reason_codes"] or [stop.code], authorization=ctx["authorization"],
             policy_version=policy_version,
         )
     cur = po["currency"]
@@ -100,7 +102,9 @@ def evaluate(inv: ExtractedInvoice, snap: Snapshot, *, min_conf: float, policy_v
                 f"fits the remaining authorization of {fmt_cents(allocation['balance_before']['remaining_net_cents'], cur)}."),
         next_action="Pass to the next AP step for approval and payment scheduling.",
         vendor_id=ctx["vendor"]["vendor_id"], vendor_name=ctx["vendor"]["legal_name"], po_id=po["po_id"],
-        checks=checks, allocation=allocation, prior_allocations=ctx["prior"], policy_version=policy_version,
+        checks=checks, allocation=allocation, prior_allocations=ctx["prior"],
+        reason_codes=["MATCHED_WITHIN_AUTHORIZATION"], authorization=ctx["authorization"],
+        policy_version=policy_version,
     )
 
 
@@ -282,54 +286,84 @@ def _price(mapping, check) -> None:
                         review_field=f"line {line.row_index + 1} unit_price")
 
 
+def _prior_invoices(snap: Snapshot, po_id: str) -> list[dict[str, Any]]:
+    """Previously accepted (allocated) invoices on this PO, oldest first."""
+    out = []
+    for a in snap.allocations:
+        if a["po_id"] != po_id:
+            continue
+        out.append({"run_id": a["run_id"], "invoice_number": a["invoice_number_norm"],
+                    "invoice_date": a.get("invoice_date"), "accepted_at": a.get("created_at"),
+                    "net_cents": a["net_cents"], "gross_cents": a["gross_cents"],
+                    "lines": [{"line_id": l["line_id"], "sku": l["sku"], "quantity": l["quantity"],
+                               "net_cents": l["net_cents"]} for l in a["lines"]]})
+    return out
+
+
 def _authorization(inv, snap: Snapshot, po, mapping, check, ctx) -> dict[str, Any]:
+    """Strict cumulative cap on net (per PO line and PO total) and quantity (per PO line).
+
+    Every comparison is evaluated, with no early exit, so a hold shows all breaches. The figures
+    are returned inside the decision so an old hold still explains itself after the ledger moves.
+    """
     before = po_balance(snap, po["po_id"])
     cur = po["currency"]
-    prior = [a for a in snap.allocations if a["po_id"] == po["po_id"]]
-    if prior and not ctx["prior"]:
-        ctx["prior"] = [{k: a[k] for k in ("run_id", "invoice_number_norm", "po_id", "net_cents", "gross_cents")}
-                        for a in prior]
+    prior_invoices = _prior_invoices(snap, po["po_id"])
+    if prior_invoices and not ctx["prior"]:
+        ctx["prior"] = [{"run_id": a["run_id"], "invoice_number_norm": a["invoice_number"], "po_id": po["po_id"],
+                         "net_cents": a["net_cents"], "gross_cents": a["gross_cents"]} for a in prior_invoices]
     bal_lines = {b["line_id"]: b for b in before["lines"]}
+    comparisons: list[dict[str, Any]] = []
+
+    def record(c: dict[str, Any], detail: str) -> None:
+        comparisons.append(c)
+        check("authorization", c["status"] == "pass", detail,
+              **{k: c[k] for k in ("measure", "scope", "line_id", "authorized", "previously_allocated", "remaining",
+                                   "incoming", "projected", "excess")})
+
+    def money_cmp(scope: str, label: str, authorized: int, prior: int, incoming: int,
+                  line_id: str | None = None, sku: str | None = None) -> None:
+        projected = prior + incoming
+        c = {"measure": "net", "scope": scope, "label": label, "line_id": line_id, "sku": sku, "unit": cur,
+             "authorized": authorized, "previously_allocated": prior, "remaining": authorized - prior,
+             "incoming": incoming, "projected": projected, "excess": max(projected - authorized, 0),
+             "status": "pass" if projected <= authorized else "fail"}
+        record(c, f"{label} net: authorized {fmt_cents(authorized, cur)}, previously allocated "
+                  f"{fmt_cents(prior, cur)}, incoming {fmt_cents(incoming, cur)}, projected {fmt_cents(projected, cur)}"
+                  + (f", excess {fmt_cents(c['excess'], cur)}" if c["excess"] else ""))
+
+    def qty_cmp(label: str, authorized: Decimal, prior: Decimal, incoming: Decimal, line_id: str, sku: str) -> None:
+        projected = prior + incoming
+        excess = max(projected - authorized, Decimal(0))
+        c = {"measure": "quantity", "scope": "line", "label": label, "line_id": line_id, "sku": sku, "unit": "units",
+             "authorized": norm_decimal(authorized), "previously_allocated": norm_decimal(prior),
+             "remaining": norm_decimal(authorized - prior), "incoming": norm_decimal(incoming),
+             "projected": norm_decimal(projected), "excess": norm_decimal(excess),
+             "status": "pass" if projected <= authorized else "fail"}
+        record(c, f"{label} quantity: authorized {c['authorized']}, previously allocated {c['previously_allocated']}, "
+                  f"incoming {c['incoming']}, projected {c['projected']}" + (f", excess {c['excess']}" if excess else ""))
+
     alloc_lines = []
+    line_row: dict[str, int] = {}
     for line, pl in mapping:
         b = bal_lines[pl["line_id"]]
+        label = f"{po['po_id']} line {pl['line_id']} {pl['sku']}"
         q = Decimal(line.quantity.value)
-        rem_q = Decimal(b["remaining_quantity"])
-        if not check("authorization", q <= rem_q,
-                     f"{pl['sku']}: prior {b['allocated_quantity']} + incoming {norm_decimal(q)} vs authorized "
-                     f"{b['authorized_quantity']}", sku=pl["sku"], prior_qty=b["allocated_quantity"],
-                     incoming_qty=norm_decimal(q), authorized_qty=b["authorized_quantity"]):
-            excess = q - rem_q
-            raise _Stop("HOLD", "QUANTITY_EXCEEDS_PO",
-                        f"{pl['sku']}: {b['allocated_quantity']} already billed + {norm_decimal(q)} on this invoice = "
-                        f"{norm_decimal(Decimal(b['allocated_quantity']) + q)}, above the {b['authorized_quantity']} "
-                        f"authorized on {po['po_id']} by {norm_decimal(excess)}.",
-                        "Ask the buyer for a PO change order or the vendor for a corrected invoice.",
-                        review_field=f"line {line.row_index + 1} quantity")
-        if not check("authorization", line.amount.value <= b["remaining_net_cents"],
-                     f"{pl['sku']}: prior {fmt_cents(b['allocated_net_cents'], cur)} + incoming "
-                     f"{fmt_cents(line.amount.value, cur)} vs authorized {fmt_cents(b['authorized_net_cents'], cur)}",
-                     sku=pl["sku"], prior_net_cents=b["allocated_net_cents"], incoming_net_cents=line.amount.value,
-                     authorized_net_cents=b["authorized_net_cents"]):
-            raise _Stop("HOLD", "AMOUNT_EXCEEDS_PO",
-                        f"{pl['sku']}: {fmt_cents(b['allocated_net_cents'], cur)} already billed + "
-                        f"{fmt_cents(line.amount.value, cur)} exceeds the {fmt_cents(b['authorized_net_cents'], cur)} "
-                        f"authorized by {fmt_cents(line.amount.value - b['remaining_net_cents'], cur)}.",
-                        "Ask the buyer for a PO change order or the vendor for a corrected invoice.",
-                        review_field=f"line {line.row_index + 1} amount")
+        line_row[pl["line_id"]] = line.row_index + 1
+        qty_cmp(label, Decimal(b["authorized_quantity"]), Decimal(b["allocated_quantity"]), q, pl["line_id"], pl["sku"])
+        money_cmp("line", label, b["authorized_net_cents"], b["allocated_net_cents"], line.amount.value,
+                  pl["line_id"], pl["sku"])
         alloc_lines.append({"line_id": pl["line_id"], "sku": pl["sku"], "quantity": norm_decimal(q),
                             "unit_price": line.unit_price.value, "net_cents": line.amount.value})
     net = inv.net.value
-    if not check("authorization", net <= before["remaining_net_cents"],
-                 f"PO {po['po_id']}: prior {fmt_cents(before['allocated_net_cents'], cur)} + incoming {fmt_cents(net, cur)} "
-                 f"vs authorized {fmt_cents(before['authorized_net_cents'], cur)}",
-                 prior_net_cents=before["allocated_net_cents"], incoming_net_cents=net,
-                 authorized_net_cents=before["authorized_net_cents"]):
-        raise _Stop("HOLD", "AMOUNT_EXCEEDS_PO",
-                    f"{po['po_id']}: {fmt_cents(before['allocated_net_cents'], cur)} already billed + {fmt_cents(net, cur)} "
-                    f"exceeds the {fmt_cents(before['authorized_net_cents'], cur)} authorized by "
-                    f"{fmt_cents(net - before['remaining_net_cents'], cur)}.",
-                    "Ask the buyer for a PO change order or the vendor for a corrected invoice.", review_field="net")
+    money_cmp("po", f"{po['po_id']} total", before["authorized_net_cents"], before["allocated_net_cents"], net)
+
+    breaches = [c for c in comparisons if c["status"] == "fail"]
+    ctx["authorization"] = {"po_id": po["po_id"], "currency": cur, "comparisons": comparisons, "breaches": breaches,
+                            "prior_invoices": prior_invoices, "balance_at_decision": before}
+    if breaches:
+        _authorization_hold(inv, po, cur, comparisons, breaches, prior_invoices, line_row, ctx)
+
     after = dict(before)
     after["allocated_net_cents"] = before["allocated_net_cents"] + net
     after["remaining_net_cents"] = before["remaining_net_cents"] - net
@@ -347,3 +381,41 @@ def _authorization(inv, snap: Snapshot, po, mapping, check, ctx) -> dict[str, An
         after["lines"].append(nb)
     return {"po_id": po["po_id"], "currency": cur, "net_cents": net, "tax_cents": inv.tax.value or 0,
             "gross_cents": inv.gross.value, "lines": alloc_lines, "balance_before": before, "balance_after": after}
+
+
+def _authorization_hold(inv, po, cur, comparisons, breaches, prior_invoices, line_row, ctx) -> None:
+    money = [c for c in breaches if c["measure"] == "net"]
+    qty = [c for c in breaches if c["measure"] == "quantity"]
+    # Deterministic primary code: any money breach outranks a quantity-only breach.
+    code = "AMOUNT_EXCEEDS_PO" if money else "QUANTITY_EXCEEDS_PO"
+    ctx["reason_codes"] = (["AMOUNT_EXCEEDS_PO"] if money else []) + (["QUANTITY_EXCEEDS_PO"] if qty else [])
+
+    parts = [f"{c['label']} net {fmt_cents(c['previously_allocated'], cur)} already allocated + "
+             f"{fmt_cents(c['incoming'], cur)} on this invoice = {fmt_cents(c['projected'], cur)}, "
+             f"{fmt_cents(c['excess'], cur)} over the {fmt_cents(c['authorized'], cur)} authorized" for c in money]
+    parts += [f"{c['label']} quantity {c['previously_allocated']} already allocated + {c['incoming']} on this invoice = "
+              f"{c['projected']}, {c['excess']} over the {c['authorized']} authorized" for c in qty]
+    earlier = ", ".join(f"{a['invoice_number']} ({fmt_cents(a['net_cents'], cur)})" for a in prior_invoices)
+    reason = (f"Invoice {inv.invoice_number.value} would take {po['po_id']} past its authorization"
+              + (f" after earlier accepted invoice(s) {earlier}" if earlier else "") + ": " + "; ".join(parts) + ".")
+
+    asks = []
+    if money:
+        asks.append(f"at least {fmt_cents(max(c['excess'] for c in money), cur)} of net authorization")
+    asks += [f"{c['excess']} units of {c['sku']}" for c in qty]
+    net_room = max(min(c["remaining"] for c in comparisons if c["measure"] == "net"), 0)
+    room = [f"{fmt_cents(net_room, cur)} net"] + [
+        f"{c['remaining']} units of {c['sku']}" for c in comparisons if c["measure"] == "quantity"]
+    action = (f"Do not pay. Ask the PO owner for a change order on {po['po_id']} adding {' and '.join(asks)}, "
+              f"or ask {ctx['vendor']['legal_name']} for a corrected invoice or credit note that fits the remaining "
+              f"{' / '.join(room)}. Re-submit when either arrives.")
+
+    if money:
+        primary = next((c for c in money if c["scope"] == "po"), money[0])
+    else:
+        primary = qty[0]
+    if primary["scope"] == "po":
+        review = "net"
+    else:
+        review = f"line {line_row[primary['line_id']]} " + ("amount" if primary["measure"] == "net" else "quantity")
+    raise _Stop("HOLD", code, reason, action, review_field=review)

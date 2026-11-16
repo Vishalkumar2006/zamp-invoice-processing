@@ -20,8 +20,9 @@ def load_snapshot(conn: sqlite3.Connection, workspace_id: str) -> Snapshot:
     for r in conn.execute("SELECT * FROM po_lines WHERE workspace_id=? ORDER BY po_id, line_id", (workspace_id,)):
         lines.setdefault(r["po_id"], []).append(dict(r))
     allocs = []
-    for a in conn.execute("SELECT a.*, r.created_at AS run_created_at FROM allocations a JOIN runs r ON r.id=a.run_id "
-                          "WHERE a.workspace_id=? ORDER BY a.id", (workspace_id,)):
+    for a in conn.execute("SELECT a.*, r.created_at AS run_created_at, r.invoice_date AS invoice_date"
+                          " FROM allocations a JOIN runs r ON r.id=a.run_id"
+                          " WHERE a.workspace_id=? ORDER BY a.id", (workspace_id,)):
         d = dict(a)
         d["lines"] = [dict(l) for l in conn.execute("SELECT * FROM allocation_lines WHERE allocation_id=?", (a["id"],))]
         allocs.append(d)

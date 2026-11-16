@@ -12,8 +12,9 @@ its evidence:
 | `BLOCKED` | The same vendor and invoice number were already accepted. Links to the earlier run. No allocation. |
 | `FAILED` | A technical error, such as an unreadable PDF or OCR timeout. Run status only, with a retry button. No allocation. |
 
-This checkpoint is **Milestone 1** (the vertical slice): procurement import, upload and job lifecycle, native and OCR
-extraction with page-level evidence, exact vendor and PO matching, atomic allocation, and live and history views.
+Current checkpoint: **Milestone 1** (the vertical slice: procurement import, upload and job lifecycle, native and OCR
+extraction with page-level evidence, exact vendor and PO matching, atomic allocation, live and history views) plus
+the **cumulative-overbilling** hold (a later invoice that, together with earlier accepted invoices, exceeds the PO).
 
 ## Run it
 
@@ -79,6 +80,14 @@ upload ─► persist PDF + run (QUEUED) ─► worker claims run
   normalized legal name, business duplicate (vendor and invoice number), printed PO (exists, same vendor, same
   currency, OPEN), arithmetic (qty × rate = amount, lines = net, net + tax = gross), SKU-to-PO-line mapping, unit
   price within **1% inclusive**, and a **strict cumulative cap** on net and quantity, counting prior allocations.
+- **Cumulative overbilling.** Every cap is compared, with no early exit: quantity and net for each affected PO line,
+  and net for the PO total. Each comparison records authorized, previously allocated, remaining, incoming pre-tax,
+  projected and excess figures. If any fail, the run is `HOLD`. The primary `reason_code` is deterministic:
+  `AMOUNT_EXCEEDS_PO` when any money cap fails, otherwise `QUANTITY_EXCEEDS_PO`. `reason_codes` lists every code
+  that applied. The hold names and links the earlier accepted invoices and gives a next action sized from the excess
+  (change order amount and units, or a corrected invoice within what remains). These figures, the prior invoices and
+  the PO balance at decision time are stored with the decision. Reopening an old hold shows what triggered it,
+  even after the live ledger has moved. The live balance is shown separately.
 - **Money** is stored as integer cents. Rates, quantities and tolerance use `Decimal`.
 - **Ledger safety** (`app/ledger.py`): `finalize` runs in one `BEGIN IMMEDIATE` transaction. It rereads state, returns
   the existing decision unchanged if the run is already decided, and retries on lock contention with a bound. The
@@ -105,10 +114,15 @@ supplied sample. They cover:
 - finalize retry and concurrent finalize (one allocation);
 - database uniqueness;
 - restart persistence;
+- cumulative overbilling across two distinct invoices that each fit the fresh PO but together exceed the
+  quantity cap, the line net cap and the PO net cap (all three breaches reported, zero allocation, explanation
+  unchanged after the ledger moves);
 - corrupt-PDF failure;
-- OCR on a rotated, image-only scan.
+- OCR on a rotated, image-only scan. The scan is drawn with the font bundled in Pillow (pinned), not rendered
+  from a non-embedded-font PDF, so the test input is the same on every host. Rendering through Poppler depended
+  on host fonts: with none installed, Poppler 26 produced a blank page.
 
-## Scope and assumptions (Milestone 1)
+## Scope and assumptions
 
 - One invoice per PDF, one PO per invoice, USD only, explicit line amounts, lines matched by SKU.
 - An invoice with no printed PO goes to `HOLD` with candidate POs. It is never auto-allocated.

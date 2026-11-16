@@ -86,6 +86,45 @@ def test_quantity_at_cap_ready_and_one_unit_over_holds():
     assert d.decision == "HOLD" and d.reason_code == "QUANTITY_EXCEEDS_PO"
 
 
+def test_cumulative_breach_of_money_and_quantity_reports_every_comparison():
+    # Prior accepted 60 units / 600,000c. Incoming 45 units / 450,000c: each fits a fresh PO alone,
+    # together they exceed the 100-unit and 1,000,000c caps.
+    inv = invoice(invoice_number=f("AT-101"), net=f(450000), gross=f(450000), lines=[line("SVC", "45", "100", 450000)])
+    d = run(inv, snapshot([prior(600000, "60", number="AT-100")]))
+    assert d.decision == "HOLD" and d.allocation is None
+    assert d.reason_code == "AMOUNT_EXCEEDS_PO"  # money outranks quantity, deterministically
+    assert d.reason_codes == ["AMOUNT_EXCEEDS_PO", "QUANTITY_EXCEEDS_PO"]
+    auth = d.authorization
+    breaches = {(b["measure"], b["scope"]): b for b in auth["breaches"]}
+    assert set(breaches) == {("quantity", "line"), ("net", "line"), ("net", "po")}
+    po_net = breaches[("net", "po")]
+    assert (po_net["authorized"], po_net["previously_allocated"], po_net["remaining"], po_net["incoming"],
+            po_net["projected"], po_net["excess"]) == (1000000, 600000, 400000, 450000, 1050000, 50000)
+    q = breaches[("quantity", "line")]
+    assert (q["authorized"], q["previously_allocated"], q["remaining"], q["incoming"], q["projected"], q["excess"]) == (
+        "100", "60", "40", "45", "105", "5")
+    assert [p["invoice_number"] for p in auth["prior_invoices"]] == ["AT-100"]
+    assert auth["balance_at_decision"]["remaining_net_cents"] == 400000
+    assert "AT-100" in d.reason and "USD 500.00" in d.reason and "105" in d.reason
+    assert "change order on PO-1" in d.next_action and "USD 500.00" in d.next_action and "5 units of SVC" in d.next_action
+    assert d.review_field == "net"
+    # Same inputs, same output.
+    assert run(inv, snapshot([prior(600000, "60", number="AT-100")])) == d
+
+
+def test_quantity_only_breach_keeps_quantity_code():
+    d = run(invoice(), snapshot([prior(400000, "51")]))
+    assert d.reason_codes == ["QUANTITY_EXCEEDS_PO"]
+    assert [b["measure"] for b in d.authorization["breaches"]] == ["quantity"]
+    assert d.review_field == "line 1 quantity"
+
+
+def test_ready_decision_records_passing_comparisons():
+    d = run(invoice(), snapshot())
+    assert d.authorization["breaches"] == []
+    assert len(d.authorization["comparisons"]) == 3 and all(c["status"] == "pass" for c in d.authorization["comparisons"])
+
+
 def test_price_tolerance_one_percent_inclusive():
     at = invoice(net=f(505000), gross=f(505000), lines=[line("SVC", "50", "101", 505000)])
     assert run(at, snapshot()).decision == "READY"

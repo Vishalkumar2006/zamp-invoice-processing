@@ -105,7 +105,8 @@ def _run_detail(conn, run_id: str) -> dict[str, Any]:
     out = _run_summary(r)
     out.update({
         "sha256": r["sha256"], "size_bytes": r["size_bytes"], "attempts": r["attempts"], "error": r["error"],
-        "started_at": r["started_at"], "policy_version": r["policy_version"], "events": events,
+        "started_at": r["started_at"], "decided_at": r["decided_at"], "policy_version": r["policy_version"],
+        "events": events,
         "extraction": json.loads(r["extraction_json"]) if r["extraction_json"] else None,
         "decision_detail": json.loads(r["decision_json"]) if r["decision_json"] else None,
         "pdf_url": f"/runs/{run_id}/pdf",

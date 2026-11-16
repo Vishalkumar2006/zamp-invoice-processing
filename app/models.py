@@ -103,4 +103,8 @@ class Decision(BaseModel):
     allocation: Optional[dict[str, Any]] = None  # present only for READY
     prior_allocations: list[dict[str, Any]] = Field(default_factory=list)
     review_field: Optional[str] = None
+    # Every reason code that applied, primary first (e.g. money and quantity cap breaches together).
+    reason_codes: list[str] = Field(default_factory=list)
+    # Cap comparisons, breaches, prior accepted invoices and the PO balance as seen at decision time.
+    authorization: Optional[dict[str, Any]] = None
     policy_version: str

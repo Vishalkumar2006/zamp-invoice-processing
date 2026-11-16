@@ -77,9 +77,12 @@ function renderDecision(run, d) {
   const alloc = d.allocation
     ? `#${esc(run.allocation_id)} · ${money(d.allocation.net_cents, d.allocation.currency)} net on ${esc(d.allocation.po_id)}`
     : "none";
+  const extraCodes = (d.reason_codes || []).filter((c) => c !== d.reason_code);
   document.getElementById("decision").innerHTML = `
-    <div class="decision-big ${cls}">${esc(d.decision)} <span class="muted" style="font-size:13px">${esc(d.reason_code)}</span></div>
+    <div class="decision-big ${cls}">${esc(d.decision)} <span class="muted" style="font-size:13px">${esc(d.reason_code)}${
+      extraCodes.length ? ` + ${esc(extraCodes.join(", "))}` : ""}</span></div>
     <p>${esc(d.reason)}</p>
+    ${renderAuthorization(run, d)}
     <dl class="kv">
       <dt>Next action</dt><dd><strong>${esc(d.next_action)}</strong></dd>
       <dt>Vendor</dt><dd>${esc(d.vendor_id || "—")} ${esc(d.vendor_name || "")}</dd>
@@ -97,6 +100,33 @@ function renderDecision(run, d) {
     `<table><thead><tr><th>Rule</th><th>Result</th><th>Detail</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
+// Cap comparisons exactly as recorded with the decision (not the live ledger).
+function renderAuthorization(run, d) {
+  const a = d.authorization;
+  if (!a) return "";
+  const cur = a.currency;
+  const fmt = (c, v) => (c.measure === "net" ? money(v, cur) : esc(v));
+  const shown = d.decision === "READY" ? a.comparisons : a.comparisons.filter((c) => c.status === "fail");
+  if (!shown.length) return "";
+  const rows = shown.map((c) => `<tr class="${esc(c.status)}"><td>${esc(c.label)}<br><span class="muted">${
+      c.measure === "net" ? "net amount" : "quantity"}</span></td>
+    <td class="num">${fmt(c, c.authorized)}</td><td class="num">${fmt(c, c.previously_allocated)}</td>
+    <td class="num">${fmt(c, c.remaining)}</td><td class="num">${fmt(c, c.incoming)}</td>
+    <td class="num">${fmt(c, c.projected)}</td><td class="num"><strong>${c.status === "fail" ? fmt(c, c.excess) : "—"}</strong></td></tr>`).join("");
+  const prior = a.prior_invoices.length
+    ? `<p>Previously accepted on ${esc(a.po_id)}: ${a.prior_invoices.map((p) =>
+        `<a href="/ui/runs/${encodeURIComponent(p.run_id)}">${esc(p.invoice_number)}</a>${p.invoice_date ? ` dated ${esc(p.invoice_date)}` : ""}
+         (${money(p.net_cents, cur)} net${p.lines.map((l) => `, ${esc(l.quantity)} × ${esc(l.sku)}`).join("")})`).join("; ")}</p>`
+    : `<p class="muted">No earlier accepted invoices on ${esc(a.po_id)}.</p>`;
+  const title = d.decision === "READY" ? "Authorization checks" : `Failed authorization checks (${shown.length})`;
+  return `<h3 class="sub">${title}</h3>
+    <p class="muted">Figures as recorded at decision time${run.decided_at ? ` (${esc(run.decided_at.replace("T", " ").slice(0, 19))} UTC)` : ""};
+      the live ledger is shown separately below.</p>
+    <div class="tablewrap"><table><thead><tr><th>Cap</th><th class="num">Authorized</th><th class="num">Previously allocated</th>
+      <th class="num">Remaining</th><th class="num">This invoice (pre-tax)</th><th class="num">Projected</th><th class="num">Excess</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>${prior}`;
+}
+
 function renderBalance(bal, d) {
   document.getElementById("balance-card").hidden = false;
   const a = d && d.allocation;
@@ -111,7 +141,7 @@ function renderBalance(bal, d) {
     : "";
   document.getElementById("balance").innerHTML = `
     <div><strong>${esc(bal.po_id)}</strong>: ${money(bal.remaining_net_cents, cur)} remaining of ${money(bal.authorized_net_cents, cur)}
-      authorized (${bal.allocation_count} allocation(s), current ledger)</div>
+      authorized (${bal.allocation_count} allocation(s), live ledger now)</div>
     <div class="bar"><span style="width:${Math.min(pct, 100)}%"></span></div>
     ${thisInv}
     <table><thead><tr><th>Line</th><th>SKU</th><th class="num">Unit price</th><th class="num">Qty auth / used / left</th>
