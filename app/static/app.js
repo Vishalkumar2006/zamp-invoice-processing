@@ -139,7 +139,7 @@ function renderPrices(d) {
   const pc = d.price_check;
   if (!pc || !pc.lines || !pc.lines.length || d.reason_code !== "PRICE_VARIANCE") return "";
   const cur = pc.currency;
-  const signed = (c) => (c > 0 ? "+" : "") + money(c, cur);
+  const signed = (c) => (c > 0 ? "+" : c < 0 ? "-" : "") + money(Math.abs(c), cur);
   const rate = (r) => `${esc(cur)} ${esc(Number(r).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 6 }))}`;
   const src = (ev) => (ev ? `p${ev.page} · ${esc(ev.method.toUpperCase())} · conf ${esc(ev.conf)} · “${esc(ev.text)}”` : "—");
   const rows = pc.lines.map((l) => `<tr class="${l.within_tolerance ? "" : "fail"}">
