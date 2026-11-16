@@ -107,4 +107,6 @@ class Decision(BaseModel):
     reason_codes: list[str] = Field(default_factory=list)
     # Cap comparisons, breaches, prior accepted invoices and the PO balance as seen at decision time.
     authorization: Optional[dict[str, Any]] = None
+    # Business-key lookup (vendor + printed invoice number) and the field comparison with the accepted invoice.
+    duplicate: Optional[dict[str, Any]] = None
     policy_version: str

@@ -73,7 +73,8 @@ function evidenceCell(f) {
 function renderDecision(run, d) {
   document.getElementById("decision-card").hidden = false;
   const cls = d.decision.toLowerCase();
-  const cands = d.candidate_po_ids.length ? ` (candidates: ${esc(d.candidate_po_ids.join(", "))})` : "";
+  const candIds = d.candidate_po_ids || [];
+  const cands = candIds.length ? ` (candidates: ${esc(candIds.join(", "))})` : "";
   const alloc = d.allocation
     ? `#${esc(run.allocation_id)} · ${money(d.allocation.net_cents, d.allocation.currency)} net on ${esc(d.allocation.po_id)}`
     : "none";
@@ -82,6 +83,7 @@ function renderDecision(run, d) {
     <div class="decision-big ${cls}">${esc(d.decision)} <span class="muted" style="font-size:13px">${esc(d.reason_code)}${
       extraCodes.length ? ` + ${esc(extraCodes.join(", "))}` : ""}</span></div>
     <p>${esc(d.reason)}</p>
+    ${renderDuplicate(d)}
     ${renderAuthorization(run, d)}
     <dl class="kv">
       <dt>Next action</dt><dd><strong>${esc(d.next_action)}</strong></dd>
@@ -92,12 +94,42 @@ function renderDecision(run, d) {
       <dt>Policy</dt><dd>${esc(d.policy_version)} · model calls: ${esc(run.model_calls)}</dd>
     </dl>`;
   document.getElementById("checks-card").hidden = false;
-  const rows = d.checks.map((c) => {
+  const rows = (d.checks || []).map((c) => {
     const src = c.compared && c.compared.source ? ` <span class="muted">(${esc(c.compared.source)})</span>` : "";
     return `<tr class="${esc(c.status)}"><td>${esc(c.rule)}</td><td>${esc(c.status)}</td><td>${esc(c.detail)}${src}</td></tr>`;
   }).join("");
   document.getElementById("checks").innerHTML =
     `<table><thead><tr><th>Rule</th><th>Result</th><th>Detail</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+// Business-duplicate comparison as recorded with the decision. Older runs have no `duplicate`.
+function renderDuplicate(d) {
+  const dup = d.duplicate;
+  if (!dup || !dup.accepted) return "";
+  const a = dup.accepted;
+  const k = dup.business_key;
+  const cur = a.currency;
+  const val = (r, v) => {
+    if (v === null || v === undefined) return '<span class="muted">not printed</span>';
+    if (r.money) return money(v, cur);
+    return esc(Array.isArray(v) ? v.join(", ") : v);
+  };
+  const label = { match: "match", conflict: "CONFLICT", not_printed: "not on this copy" };
+  const rows = dup.comparison.map((r) => `<tr class="${r.status === "conflict" ? "fail" : ""}"><td>${esc(r.field)}</td>
+    <td>${val(r, r.incoming)}</td><td>${val(r, r.accepted)}</td><td>${esc(label[r.status] || r.status)}</td></tr>`).join("");
+  const title = { corroborated: "Duplicate of an accepted invoice", conflict: "Same invoice number, different content",
+    identity_uncertain: "Possible duplicate (uncertain OCR identity)" }[dup.outcome] || "Duplicate check";
+  return `<h3 class="sub">${esc(title)}</h3>
+    <dl class="kv">
+      <dt>Business key</dt><dd>vendor <strong>${esc(k.vendor_id)}</strong> ${esc(k.vendor_name || "")} + invoice number
+        <strong>${esc(k.invoice_number)}</strong>${k.invoice_number_raw && k.invoice_number_raw !== k.invoice_number
+          ? ` (printed “${esc(k.invoice_number_raw)}”)` : ""}</dd>
+      <dt>Accepted invoice</dt><dd><a href="/ui/runs/${encodeURIComponent(a.run_id)}">${esc(a.invoice_number)}</a>
+        ${a.invoice_date ? `dated ${esc(a.invoice_date)}` : ""} · ${money(a.gross_cents, cur)} on ${esc(a.po_id)}
+        · accepted ${esc((a.accepted_at || "").replace("T", " ").slice(0, 16))} · allocation #${esc(a.allocation_id)}</dd>
+    </dl>
+    <div class="tablewrap"><table><thead><tr><th>Field</th><th>This document</th><th>Accepted invoice</th><th>Result</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>`;
 }
 
 // Cap comparisons exactly as recorded with the decision (not the live ledger).

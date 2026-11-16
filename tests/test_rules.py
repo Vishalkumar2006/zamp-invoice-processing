@@ -46,8 +46,14 @@ def snapshot(allocations=None, status="OPEN", vendor_status="APPROVED") -> Snaps
     )
 
 
-def prior(net_cents, qty, number="AT-099"):
+def native(value):
+    return Field_(raw=str(value), value=value,
+                  evidence=Evidence(page=1, method="native", text=str(value), bbox=(0, 0, 1, 1), conf=100.0))
+
+
+def prior(net_cents, qty, number="AT-099", date="2026-05-01"):
     return {"id": 1, "run_id": "run_prev", "vendor_id": "V1", "invoice_number_norm": number, "po_id": "PO-1",
+            "invoice_date": date, "created_at": "2026-05-02T10:00:00.000+00:00",
             "currency": "USD", "net_cents": net_cents, "tax_cents": 0, "gross_cents": net_cents,
             "lines": [{"line_id": "1", "sku": "SVC", "quantity": qty, "unit_price": "100", "net_cents": net_cents}]}
 
@@ -166,8 +172,69 @@ def test_duplicate_identical_blocks_and_conflict_holds():
     d = run(invoice(), snap)
     assert d.decision == "BLOCKED" and d.reason_code == "DUPLICATE_INVOICE"
     assert d.prior_allocations[0]["run_id"] == "run_prev"
+    dup = d.duplicate
+    assert dup["outcome"] == "corroborated" and d.po_id == "PO-1"
+    assert dup["business_key"] == {"vendor_id": "V1", "vendor_name": "ACME Testing Co", "invoice_number": "AT-100",
+                                   "invoice_number_raw": "AT-100"}
+    assert dup["accepted"]["run_id"] == "run_prev" and dup["accepted"]["invoice_date"] == "2026-05-01"
+    assert {r["status"] for r in dup["comparison"]} == {"match"}
+    assert "Do not pay again" in d.next_action
     changed = invoice(net=f(400000), gross=f(400000), lines=[line("SVC", "40", "100", 400000)])
-    assert run(changed, snap).reason_code == "DUPLICATE_NUMBER_CONFLICT"
+    c = run(changed, snap)
+    assert c.decision == "HOLD" and c.reason_code == "DUPLICATE_NUMBER_CONFLICT" and c.allocation is None
+    assert [r["field"] for r in c.duplicate["comparison"] if r["status"] == "conflict"] == [
+        "net", "gross", "SVC quantity", "SVC amount"]
+
+
+def test_same_key_and_amounts_with_different_printed_date_is_a_conflict():
+    snap = snapshot([prior(500000, "50", number="AT-100", date="2026-05-01")])
+    d = run(invoice(invoice_date=f("2026-06-01")), snap)
+    assert d.decision == "HOLD" and d.reason_code == "DUPLICATE_NUMBER_CONFLICT"
+    conflicts = [r for r in d.duplicate["comparison"] if r["status"] == "conflict"]
+    assert [(r["field"], r["accepted"], r["incoming"]) for r in conflicts] == [
+        ("invoice_date", "2026-05-01", "2026-06-01")]
+    assert d.review_field == "invoice_date" and "2026-06-01" in d.reason and d.allocation is None
+
+
+def test_copy_without_printed_po_still_corroborates():
+    snap = snapshot([prior(500000, "50", number="AT-100")])
+    d = run(invoice(po_reference=Field_()), snap)
+    assert d.decision == "BLOCKED"
+    assert {r["field"]: r["status"] for r in d.duplicate["comparison"]}["po_reference"] == "not_printed"
+
+
+def test_leading_zeros_and_punctuation_make_distinct_invoice_numbers():
+    snap = snapshot([prior(300000, "30", number="AT-100")])
+    for other in ("AT-0100", "AT100", "AT-100A", "AT-100/1"):
+        d = run(invoice(invoice_number=native(other), net=f(300000), gross=f(300000),
+                        lines=[line("SVC", "30", "100", 300000)]), snap)
+        assert d.decision == "READY", (other, d.reason_code)
+        assert d.duplicate["outcome"] == "no_match"
+
+
+def test_distinct_number_with_same_vendor_po_and_amount_goes_through_normal_checks():
+    snap = snapshot([prior(300000, "30", number="AT-100")])
+    same_amount = dict(net=f(300000), gross=f(300000), lines=[line("SVC", "30", "100", 300000)])
+    assert run(invoice(invoice_number=native("AT-101"), **same_amount), snap).decision == "READY"
+    # ... and is still subject to the authorization cap.
+    big = snapshot([prior(800000, "80", number="AT-100")])
+    d = run(invoice(invoice_number=native("AT-101"), **same_amount), big)
+    assert d.decision == "HOLD" and d.reason_code == "AMOUNT_EXCEEDS_PO"
+
+
+def test_ocr_confusable_near_match_fails_closed_but_native_text_does_not():
+    snap = snapshot([prior(300000, "30", number="AT-100")])
+    same_amount = dict(net=f(300000), gross=f(300000), lines=[line("SVC", "30", "100", 300000)])
+    d = run(invoice(invoice_number=f("AT-1OO"), **same_amount), snap)  # OCR read letter O
+    assert d.decision == "HOLD" and d.reason_code == "DUPLICATE_IDENTITY_UNCERTAIN" and d.allocation is None
+    assert d.duplicate["accepted"]["invoice_number"] == "AT-100"
+    assert run(invoice(invoice_number=native("AT-1OO"), **same_amount), snap).decision == "READY"
+
+
+def test_held_invoice_does_not_count_for_duplicates():
+    # Only accepted allocations are in the snapshot; a previously HELD AT-100 leaves no trace,
+    # so a corrected resubmission with the same number is evaluated normally.
+    assert run(invoice(), snapshot([])).decision == "READY"
 
 
 def test_extraction_issues_hold_and_evaluate_is_pure():

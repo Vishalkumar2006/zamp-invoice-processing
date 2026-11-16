@@ -5,7 +5,8 @@ evaluate(invoice, snapshot) -> Decision
 Priority order (first failing rule decides):
   1. evidence      critical fields present, unambiguous and above the confidence floor
   2. vendor        unique approved vendor by normalised legal name
-  3. duplicate     vendor + invoice number already allocated -> BLOCKED (identical) / HOLD (conflict)
+  3. duplicate     vendor + invoice number already accepted -> BLOCKED (corroborated copy) /
+                   HOLD (material conflict, or OCR-confusable near match)
   4. po            printed PO exists, belongs to the vendor, same currency, OPEN
   5. arithmetic    qty x rate = line amount, lines = net, net + tax = gross
   6. line mapping  every invoice line maps by SKU to exactly one PO line
@@ -67,7 +68,7 @@ def po_balance(snap: Snapshot, po_id: str) -> dict[str, Any]:
 def evaluate(inv: ExtractedInvoice, snap: Snapshot, *, min_conf: float, policy_version: str) -> Decision:
     checks: list[dict[str, Any]] = []
     ctx: dict[str, Any] = {"vendor": None, "po": None, "candidates": [], "prior": [], "authorization": None,
-                           "reason_codes": []}
+                           "reason_codes": [], "duplicate": None}
 
     def check(rule: str, ok: bool, detail: str, **compared: Any) -> bool:
         checks.append({"rule": rule, "status": "pass" if ok else "fail", "detail": detail, "compared": compared})
@@ -92,6 +93,7 @@ def evaluate(inv: ExtractedInvoice, snap: Snapshot, *, min_conf: float, policy_v
             po_id=ctx["po"]["po_id"] if ctx["po"] else None, candidate_po_ids=ctx["candidates"],
             checks=checks, prior_allocations=ctx["prior"], review_field=stop.review_field,
             reason_codes=ctx["reason_codes"] or [stop.code], authorization=ctx["authorization"],
+            duplicate=ctx["duplicate"],
             policy_version=policy_version,
         )
     cur = po["currency"]
@@ -104,6 +106,7 @@ def evaluate(inv: ExtractedInvoice, snap: Snapshot, *, min_conf: float, policy_v
         vendor_id=ctx["vendor"]["vendor_id"], vendor_name=ctx["vendor"]["legal_name"], po_id=po["po_id"],
         checks=checks, allocation=allocation, prior_allocations=ctx["prior"],
         reason_codes=["MATCHED_WITHIN_AUTHORIZATION"], authorization=ctx["authorization"],
+        duplicate=ctx["duplicate"],
         policy_version=policy_version,
     )
 
@@ -173,25 +176,126 @@ def _vendor(inv: ExtractedInvoice, snap: Snapshot, check) -> dict[str, Any]:
     return v
 
 
+_OCR_CONFUSABLE = str.maketrans({"O": "0", "Q": "0", "D": "0", "I": "1", "L": "1", "|": "1", "S": "5", "B": "8",
+                                 "Z": "2", "G": "6"})
+
+
+def _ocr_canonical(number: str) -> str:
+    """Collapse characters OCR commonly confuses. Used only to detect *uncertain* identity, never
+    to declare two invoice numbers equal."""
+    return number.upper().translate(_OCR_CONFUSABLE)
+
+
+def _accepted_record(a: dict[str, Any]) -> dict[str, Any]:
+    return {"run_id": a["run_id"], "allocation_id": a.get("id"), "invoice_number": a["invoice_number_norm"],
+            "invoice_date": a.get("invoice_date"), "accepted_at": a.get("created_at"), "po_id": a["po_id"],
+            "currency": a["currency"], "net_cents": a["net_cents"], "tax_cents": a["tax_cents"],
+            "gross_cents": a["gross_cents"]}
+
+
+def _compare_with_accepted(inv: ExtractedInvoice, a: dict[str, Any]) -> list[dict[str, Any]]:
+    """Field-by-field comparison of the incoming document with the accepted invoice.
+
+    status: match | conflict | not_printed (an optional value absent on the incoming copy)."""
+    rows: list[dict[str, Any]] = []
+
+    def row(field: str, incoming: Any, accepted: Any, *, optional: bool = False, money: bool = False) -> None:
+        if incoming is None and optional:
+            status = "not_printed"
+        else:
+            status = "match" if incoming == accepted else "conflict"
+        rows.append({"field": field, "incoming": incoming, "accepted": accepted, "status": status, "money": money})
+
+    row("invoice_date", inv.invoice_date.value, a.get("invoice_date"))
+    row("currency", inv.currency.value, a["currency"])
+    row("net", inv.net.value, a["net_cents"], money=True)
+    row("tax", inv.tax.value if inv.tax.value is not None else 0, a["tax_cents"], money=True)
+    row("gross", inv.gross.value, a["gross_cents"], money=True)
+    row("po_reference", inv.po_reference.value, a["po_id"], optional=True)
+    acc_lines = {l["sku"]: l for l in a.get("lines", [])}
+    inc_skus = [l.sku.value for l in inv.lines]
+    row("line_skus", sorted(inc_skus), sorted(acc_lines))
+    for line in inv.lines:
+        al = acc_lines.get(line.sku.value)
+        if al is None:
+            continue
+        sku = line.sku.value
+        row(f"{sku} quantity", norm_decimal(Decimal(line.quantity.value)), norm_decimal(Decimal(al["quantity"])))
+        row(f"{sku} unit_price", norm_decimal(Decimal(line.unit_price.value)), norm_decimal(Decimal(al["unit_price"])))
+        row(f"{sku} amount", line.amount.value, al["net_cents"], money=True)
+    return rows
+
+
 def _duplicate(inv, snap: Snapshot, vendor, check, ctx) -> None:
+    """Business duplicate: approved vendor ID + conservatively normalised printed invoice number,
+    looked up against previously *accepted* (allocated) invoices only. Held or blocked runs never
+    count, so a corrected resubmission after a HOLD is evaluated normally."""
     key = inv.invoice_number.value
-    prior = [a for a in snap.allocations if a["vendor_id"] == vendor["vendor_id"] and a["invoice_number_norm"] == key]
-    if not prior:
-        check("duplicate", True, f"no earlier allocation for {vendor['vendor_id']} / {key}")
+    vid = vendor["vendor_id"]
+    business_key = {"vendor_id": vid, "vendor_name": vendor["legal_name"], "invoice_number": key,
+                    "invoice_number_raw": inv.invoice_number.raw}
+    accepted = [a for a in snap.allocations if a["vendor_id"] == vid]
+    exact = [a for a in accepted if a["invoice_number_norm"] == key]
+    dup: dict[str, Any] = {"business_key": business_key, "accepted": None, "comparison": [], "outcome": "no_match"}
+    ctx["duplicate"] = dup
+
+    if not exact:
+        # Fail closed on uncertain identity: an OCR-read number that differs from an accepted number
+        # of the same vendor only by OCR-confusable characters is not a verified distinct number.
+        ev = inv.invoice_number.evidence
+        if ev is not None and ev.method == "ocr":
+            near = [a for a in accepted if _ocr_canonical(a["invoice_number_norm"]) == _ocr_canonical(key)]
+            if near:
+                a = near[0]
+                dup.update(accepted=_accepted_record(a), comparison=_compare_with_accepted(inv, a),
+                           outcome="identity_uncertain")
+                ctx["po"] = snap.pos.get(a["po_id"])  # the PO the accepted invoice was allocated to
+                ctx["prior"] = [{"run_id": a["run_id"], "invoice_number_norm": a["invoice_number_norm"],
+                                 "po_id": a["po_id"], "net_cents": a["net_cents"], "gross_cents": a["gross_cents"]}]
+                check("duplicate", False, f"OCR read {key!r}; accepted {a['invoice_number_norm']!r} differs only by "
+                      f"OCR-confusable characters", accepted_run=a["run_id"])
+                raise _Stop("HOLD", "DUPLICATE_IDENTITY_UNCERTAIN",
+                            f"The scanned invoice number {key!r} differs from accepted invoice "
+                            f"{a['invoice_number_norm']!r} (run {a['run_id']}) only by characters OCR often confuses.",
+                            f"Compare the printed invoice number on the PDF with {a['invoice_number_norm']}. If it is "
+                            f"the same invoice, close this as a duplicate; if not, confirm the number and re-submit.",
+                            review_field="invoice_number")
+        check("duplicate", True, f"no accepted invoice for {vid} / {key}")
         return
-    p = prior[0]
-    ctx["prior"] = [{k: p[k] for k in ("run_id", "invoice_number_norm", "po_id", "net_cents", "gross_cents")}]
-    same = (p["gross_cents"] == inv.gross.value and p["net_cents"] == inv.net.value
-            and p["currency"] == inv.currency.value and p["po_id"] == (inv.po_reference.value or p["po_id"]))
-    check("duplicate", False, f"invoice {key} already allocated in run {p['run_id']}", earlier_run=p["run_id"],
-          earlier_gross=p["gross_cents"], incoming_gross=inv.gross.value)
-    if same:
+
+    a = exact[0]
+    comparison = _compare_with_accepted(inv, a)
+    conflicts = [r for r in comparison if r["status"] == "conflict"]
+    dup.update(accepted=_accepted_record(a), comparison=comparison,
+               outcome="conflict" if conflicts else "corroborated")
+    ctx["po"] = snap.pos.get(a["po_id"])  # the PO the accepted invoice was allocated to
+    ctx["prior"] = [{"run_id": a["run_id"], "invoice_number_norm": a["invoice_number_norm"], "po_id": a["po_id"],
+                     "net_cents": a["net_cents"], "gross_cents": a["gross_cents"]}]
+    when = f" dated {a.get('invoice_date')}" if a.get("invoice_date") else ""
+    if not conflicts:
+        matched = ", ".join(r["field"] for r in comparison if r["status"] == "match")
+        check("duplicate", False, f"{vid} / {key} already accepted in run {a['run_id']}; corroborated: {matched}",
+              accepted_run=a["run_id"])
         raise _Stop("BLOCKED", "DUPLICATE_INVOICE",
-                    f"Invoice {key} from {vendor['legal_name']} was already accepted (run {p['run_id']}).",
-                    "Do not pay again; link to the earlier record.")
+                    f"Invoice {key}{when} from {vendor['legal_name']} was already accepted on "
+                    f"{(a.get('created_at') or '')[:10]} (run {a['run_id']}). This document repeats it: "
+                    f"{matched} all match.",
+                    f"Do not pay again. Close this submission as a copy of {key} and tell the vendor the original "
+                    f"is already in process.")
+
+    def show(r: dict[str, Any]) -> str:
+        fmt = (lambda v: fmt_cents(v, a["currency"])) if r["money"] else (lambda v: str(v))
+        return f"{r['field']} (accepted {fmt(r['accepted'])}, this document {fmt(r['incoming'])})"
+
+    check("duplicate", False, f"{vid} / {key} already accepted in run {a['run_id']} with different "
+          + ", ".join(r["field"] for r in conflicts), accepted_run=a["run_id"],
+          conflicts=[r["field"] for r in conflicts])
     raise _Stop("HOLD", "DUPLICATE_NUMBER_CONFLICT",
-                f"Invoice number {key} was already accepted (run {p['run_id']}) with different amounts or PO.",
-                "Ask the vendor whether this is a correction or a new invoice.", review_field="invoice_number")
+                f"Invoice number {key} from {vendor['legal_name']} was already accepted (run {a['run_id']}{when}), "
+                f"but this document differs: " + "; ".join(show(r) for r in conflicts) + ".",
+                f"Do not pay. Ask {vendor['legal_name']} whether this is a correction of {key}; a correction needs a "
+                f"credit note for the original and a new invoice number, a new charge needs its own number.",
+                review_field="invoice_" + ("date" if conflicts[0]["field"] == "invoice_date" else "number"))
 
 
 def _po(inv, snap: Snapshot, vendor, check, ctx) -> dict[str, Any]:

@@ -102,4 +102,10 @@ def finalize(conn: sqlite3.Connection, run_id: str) -> dict[str, Any]:
                 raise
             last_exc = exc
             time.sleep(0.05 * (2 ** attempt))
+        except sqlite3.IntegrityError as exc:
+            # The same business invoice (or run) was allocated by a concurrent transaction. The
+            # write was rolled back; re-evaluate against fresh state, which will now see it.
+            if "UNIQUE" not in str(exc):
+                raise
+            last_exc = exc
     raise RuntimeError(f"finalize could not acquire the database lock: {last_exc}")

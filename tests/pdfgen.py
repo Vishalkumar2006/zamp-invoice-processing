@@ -48,7 +48,8 @@ def make_pdf(items: list[Text], width: float = 612, height: float = 792) -> byte
 def invoice_items(*, supplier="Harborline Calibration Inc", number="HCI-0042", date="March 4, 2026",
                 po="PO-7781", lines=(("CAL-STD", "Standard calibration", "12", "$250.00", "$3,000.00"),
                                      ("CAL-TRV", "Technician travel", "1", "$480.00", "$480.00")),
-                subtotal="$3,480.00", tax="$0.00", total="$3,480.00", currency_label="Amount due (USD)") -> list[Text]:
+                subtotal="$3,480.00", tax="$0.00", total="$3,480.00", currency_label="Amount due (USD)",
+                footer="Thank you for your business. Page 1 of 1") -> list[Text]:
     """Layout items for a synthetic invoice (shared by the native and scanned variants)."""
     t: list[Text] = [
         Text(40, 40, supplier, 16, True),
@@ -75,7 +76,7 @@ def invoice_items(*, supplier="Harborline Calibration Inc", number="HCI-0042", d
         t += [Text(430, y, "Sales tax"), Text(520, y, tax)]
     y += 22
     t += [Text(380, y, currency_label, bold=True), Text(520, y, total, bold=True)]
-    t.append(Text(40, 740, "Thank you for your business. Page 1 of 1", 8))
+    t.append(Text(40, 740, footer, 8))
     return t
 
 
