@@ -68,7 +68,7 @@ def po_balance(snap: Snapshot, po_id: str) -> dict[str, Any]:
 def evaluate(inv: ExtractedInvoice, snap: Snapshot, *, min_conf: float, policy_version: str) -> Decision:
     checks: list[dict[str, Any]] = []
     ctx: dict[str, Any] = {"vendor": None, "po": None, "candidates": [], "prior": [], "authorization": None,
-                           "reason_codes": [], "duplicate": None, "po_candidates": None}
+                           "reason_codes": [], "duplicate": None, "po_candidates": None, "price_check": None}
 
     def check(rule: str, ok: bool, detail: str, **compared: Any) -> bool:
         checks.append({"rule": rule, "status": "pass" if ok else "fail", "detail": detail, "compared": compared})
@@ -83,7 +83,7 @@ def evaluate(inv: ExtractedInvoice, snap: Snapshot, *, min_conf: float, policy_v
         ctx["po"] = po
         _arithmetic(inv, check)
         mapping = _line_mapping(inv, snap, po, check)
-        _price(mapping, check)
+        _price(inv, po, mapping, check, ctx)
         allocation = _authorization(inv, snap, po, mapping, check, ctx)
     except _Stop as stop:
         return Decision(
@@ -93,7 +93,7 @@ def evaluate(inv: ExtractedInvoice, snap: Snapshot, *, min_conf: float, policy_v
             po_id=ctx["po"]["po_id"] if ctx["po"] else None, candidate_po_ids=ctx["candidates"],
             checks=checks, prior_allocations=ctx["prior"], review_field=stop.review_field,
             reason_codes=ctx["reason_codes"] or [stop.code], authorization=ctx["authorization"],
-            duplicate=ctx["duplicate"], po_candidates=ctx["po_candidates"],
+            duplicate=ctx["duplicate"], po_candidates=ctx["po_candidates"], price_check=ctx["price_check"],
             policy_version=policy_version,
         )
     cur = po["currency"]
@@ -106,7 +106,7 @@ def evaluate(inv: ExtractedInvoice, snap: Snapshot, *, min_conf: float, policy_v
         vendor_id=ctx["vendor"]["vendor_id"], vendor_name=ctx["vendor"]["legal_name"], po_id=po["po_id"],
         checks=checks, allocation=allocation, prior_allocations=ctx["prior"],
         reason_codes=["MATCHED_WITHIN_AUTHORIZATION"], authorization=ctx["authorization"],
-        duplicate=ctx["duplicate"],
+        duplicate=ctx["duplicate"], price_check=ctx["price_check"],
         policy_version=policy_version,
     )
 
@@ -332,6 +332,7 @@ def _candidate_evidence(inv: ExtractedInvoice, snap: Snapshot, po: dict[str, Any
     if po["currency"] != inv.currency.value:
         failures.append(f"currency {po['currency']} vs invoice {inv.currency.value}")
     lines = []
+    mapped_by: dict[str, int] = {}  # PO line id -> invoice line already mapped to it
     for i, line in enumerate(inv.lines, start=1):
         sku = line.sku.value
         pl = by_sku.get(sku)
@@ -343,6 +344,16 @@ def _candidate_evidence(inv: ExtractedInvoice, snap: Snapshot, po: dict[str, Any
             failures.append(f"no {sku} line")
             lines.append(row)
             continue
+        if pl["line_id"] in mapped_by:
+            # Each invoice line must map to its own PO line (the rule used for an explicit PO).
+            first = mapped_by[pl["line_id"]]
+            row.update(po_line_id=pl["line_id"], source=f"{pl['source_file']} row {pl['source_row']}", sku_ok=False,
+                       price_ok=False, quantity_ok=False, amount_ok=False, repeated_mapping_of=first)
+            failures.append(f"invoice lines {first} and {i} both map to {sku} PO line {pl['line_id']} "
+                            f"(each invoice line needs its own PO line)")
+            lines.append(row)
+            continue
+        mapped_by[pl["line_id"]] = i
         b = bal_lines[pl["line_id"]]
         inv_rate, po_rate = Decimal(line.unit_price.value), Decimal(pl["unit_price"])
         variance = abs(inv_rate - po_rate)
@@ -498,18 +509,84 @@ def _line_mapping(inv, snap: Snapshot, po, check) -> list[tuple[Any, dict[str, A
     return mapping
 
 
-def _price(mapping, check) -> None:
+def _signed_pct(value: Decimal) -> str:
+    return f"{'+' if value > 0 else ''}{value:.2f}%"
+
+
+def _fmt_rate(rate: str, cur: str) -> str:
+    """Exact unit price with at least two decimals (never rounded to cents)."""
+    d = Decimal(rate)
+    q = d if -d.as_tuple().exponent > 2 else d.quantize(Decimal("0.01"))
+    return f"{cur} {q:,}"
+
+
+def _signed_money(cents: int, cur: str) -> str:
+    return ("+" if cents > 0 else "") + fmt_cents(cents, cur)
+
+
+def _price(inv, po, mapping, check, ctx) -> None:
+    """Unit price vs PO price on every mapped line (inclusive 1% per line), with no early exit.
+
+    Each comparison keeps the invoice evidence and the PO line's CSV source row. Line differences are
+    pre-tax and measured at the invoiced quantity; tax is reported separately."""
+    cur = po["currency"]
+    rows: list[dict[str, Any]] = []
     for line, pl in mapping:
+        qty = Decimal(line.quantity.value)
         inv_rate, po_rate = Decimal(line.unit_price.value), Decimal(pl["unit_price"])
-        diff = abs(inv_rate - po_rate)
-        ok = diff <= po_rate * PRICE_TOLERANCE
-        pct = (diff / po_rate * 100) if po_rate else Decimal(0)
-        if not check("price", ok, f"{line.sku.value}: invoice {inv_rate} vs PO {po_rate} ({pct:.2f}% variance, limit 1%)",
-                     sku=line.sku.value, invoice_rate=str(inv_rate), po_rate=str(po_rate), variance_pct=f"{pct:.4f}"):
-            raise _Stop("HOLD", "PRICE_VARIANCE",
-                        f"{line.sku.value} unit price {inv_rate} differs from PO price {po_rate} by {pct:.2f}% (limit 1%).",
-                        "Ask the buyer to approve the price or the vendor to re-bill.",
-                        review_field=f"line {line.row_index + 1} unit_price")
+        delta = inv_rate - po_rate
+        ok = abs(delta) <= po_rate * PRICE_TOLERANCE
+        pct = (delta / po_rate * 100) if po_rate else Decimal(0)
+        at_po_price = decimal_to_cents(qty * po_rate)
+        diff_cents = line.amount.value - at_po_price
+        ev = line.unit_price.evidence
+        row = {"line": line.row_index + 1, "sku": line.sku.value, "po_id": po["po_id"], "po_line_id": pl["line_id"],
+               "quantity": norm_decimal(qty), "invoice_unit_price": norm_decimal(inv_rate),
+               "po_unit_price": norm_decimal(po_rate), "variance_pct": f"{pct:.4f}", "variance_display": _signed_pct(pct),
+               "invoice_amount_cents": line.amount.value, "amount_at_po_price_cents": at_po_price,
+               "amount_difference_cents": diff_cents, "within_tolerance": ok,
+               "invoice_evidence": ev.model_dump() if ev is not None else None,
+               "invoice_amount_evidence": line.amount.evidence.model_dump() if line.amount.evidence else None,
+               "po_source": f"{pl['source_file']} row {pl['source_row']}"}
+        rows.append(row)
+        check("price", ok, f"line {row['line']} {row['sku']}: invoice {row['invoice_unit_price']} vs PO "
+              f"{row['po_unit_price']} ({row['variance_display']}, limit 1%); {_signed_money(diff_cents, cur)} at "
+              f"{row['quantity']} units", sku=row["sku"], invoice_rate=row["invoice_unit_price"],
+              po_rate=row["po_unit_price"], variance_pct=row["variance_pct"], amount_difference_cents=diff_cents,
+              source=row["po_source"])
+    failed = [r for r in rows if not r["within_tolerance"]]
+    at_po_total = sum(r["amount_at_po_price_cents"] for r in rows)
+    net_diff = inv.net.value - at_po_total
+    gross_line_diff = sum(abs(r["amount_difference_cents"]) for r in failed)
+    offsetting = bool(failed) and abs(net_diff) < gross_line_diff
+    ctx["price_check"] = {
+        "po_id": po["po_id"], "currency": cur, "tolerance_pct": "1", "tolerance_rule": "per line, inclusive",
+        "lines": rows, "failed_lines": [r["line"] for r in failed],
+        "subtotal_cents": inv.net.value, "subtotal_at_po_prices_cents": at_po_total, "subtotal_difference_cents": net_diff,
+        "offsetting": offsetting, "tax_cents": inv.tax.value or 0, "gross_cents": inv.gross.value,
+        "note": "Line differences are pre-tax at the invoiced quantity. PO authorization and allocations are pre-tax; "
+                "tax is shown separately.",
+    }
+    if not failed:
+        return
+    parts = [f"line {r['line']} {r['sku']} at {_fmt_rate(r['invoice_unit_price'], cur)} vs "
+             f"PO {_fmt_rate(r['po_unit_price'], cur)} ({r['variance_display']}, "
+             f"{_signed_money(r['amount_difference_cents'], cur)} at {r['quantity']} units)" for r in failed]
+    n = len(failed)
+    reason = (f"{n} line{'s are' if n > 1 else ' is'} outside the 1% unit-price tolerance on {po['po_id']}: "
+              + "; ".join(parts) + ".")
+    if offsetting:
+        reason += (f" The differences offset: the subtotal {fmt_cents(inv.net.value, cur)} is "
+                   + ("the same as" if net_diff == 0 else f"only {_signed_money(net_diff, cur)} from")
+                   + f" the {fmt_cents(at_po_total, cur)} the lines would cost at PO prices, but each line is checked "
+                   f"on its own price.")
+    reason += f" Tax {fmt_cents(inv.tax.value or 0, cur)} is separate and not part of the comparison."
+    rebill = ", ".join(f"{r['sku']} (line {r['line']}) at {_fmt_rate(r['po_unit_price'], cur)}"
+                       for r in failed)
+    po_lines = " and ".join(f"line {r['po_line_id']} ({r['sku']})" for r in failed)
+    action = (f"Do not pay. Ask {ctx['vendor']['legal_name']} to re-bill {rebill} at the PO prices, or ask the buyer "
+              f"to approve new prices on {po['po_id']} {po_lines}. Do not accept the lines netted against each other.")
+    raise _Stop("HOLD", "PRICE_VARIANCE", reason, action, review_field=f"line {failed[0]['line']} unit_price")
 
 
 def _prior_invoices(snap: Snapshot, po_id: str) -> list[dict[str, Any]]:

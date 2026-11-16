@@ -15,8 +15,9 @@ its evidence:
 Current checkpoint: **Milestone 1** (the vertical slice: procurement import, upload and job lifecycle, native and OCR
 extraction with page-level evidence, exact vendor and PO matching, atomic allocation, live and history views) plus
 the **cumulative-overbilling** hold (a later invoice that, together with earlier accepted invoices, exceeds the PO)
-**duplicate resubmission** handling (a re-sent or scanned copy of an accepted invoice), and **ambiguous PO**
-explanations (no PO printed, several open POs fit).
+**duplicate resubmission** handling (a re-sent or scanned copy of an accepted invoice), **ambiguous PO**
+explanations (no PO printed, several open POs fit), and **offsetting line prices** (per-line price differences
+that cancel out in the subtotal).
 
 ## Run it
 
@@ -115,6 +116,15 @@ upload ─► persist PDF + run (QUEUED) ─► worker claims run
   prints a delivery reference and it reads at confidence 80 or above, it's included in the next action (ask
   procurement which PO covers that delivery). The run view shows the candidates side by side. Everything is stored
   with the decision.
+- **Unit prices, line by line.** Every mapped line is checked before the price decision: the invoice unit price must
+  be within **1% (inclusive)** of its PO line price. If any line fails, the run is `HOLD / PRICE_VARIANCE` with
+  zero allocations. Each line records the invoice and PO prices, the signed variance (for example `+5.00%`,
+  `-7.50%`), the signed pre-tax amount difference at the invoiced quantity, the invoice page evidence and the PO
+  line's CSV row. The decision also records the subtotal at invoice prices against the subtotal at PO prices. When
+  line differences cancel out, the hold says so explicitly. Tax is reported separately; authorization and
+  allocations stay pre-tax. The next action names each affected line and its PO price.
+- **Candidate line mapping** uses the same rule as an explicit PO: each invoice line needs its own PO line. A
+  candidate PO that would map two invoice rows to one PO line is shown as ineligible, with the reason.
 - **Money** is stored as integer cents. Rates, quantities and tolerance use `Decimal`.
 - **Ledger safety** (`app/ledger.py`): `finalize` runs in one `BEGIN IMMEDIATE` transaction. It rereads state, returns
   the existing decision unchanged if the run is already decided, and retries on lock contention with a bound. The
@@ -153,6 +163,9 @@ supplied sample. They cover:
   a low-confidence delivery reference, and an ambiguous invoice over HTTP that leaves the ledger byte-identical;
 - OCR near matches: a scan whose look-alike number corroborates a copy (held), and a scan with a distinct number,
   later date and new amounts (accepted);
+- unit prices: offsetting differences with an unchanged subtotal and separate tax (both lines reported, over HTTP
+  too), exactly +1% and -1% accepted, +1.01% and -1.01% held, and a single failing line among passing ones;
+- a repeated SKU against a candidate PO, ineligible just like an explicit PO;
 - OCR on a rotated, image-only scan. The scan is drawn with the font bundled in Pillow (pinned), not rendered
   from a non-embedded-font PDF, so the test input is the same on every host. Rendering through Poppler depended
   on host fonts: with none installed, Poppler 26 produced a blank page.

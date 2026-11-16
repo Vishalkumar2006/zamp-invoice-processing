@@ -113,4 +113,6 @@ class Decision(BaseModel):
     duplicate: Optional[dict[str, Any]] = None
     # Missing printed PO: every vendor PO compared against the verified invoice lines at decision time.
     po_candidates: Optional[dict[str, Any]] = None
+    # Unit price vs PO price for every mapped line, with signed variance and amount difference.
+    price_check: Optional[dict[str, Any]] = None
     policy_version: str
