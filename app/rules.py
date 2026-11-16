@@ -581,10 +581,11 @@ def _price(inv, po, mapping, check, ctx) -> None:
                    + f" the {fmt_cents(at_po_total, cur)} the lines would cost at PO prices, but each line is checked "
                    f"on its own price.")
     reason += f" Tax {fmt_cents(inv.tax.value or 0, cur)} is separate and not part of the comparison."
-    rebill = ", ".join(f"{r['sku']} (line {r['line']}) at {_fmt_rate(r['po_unit_price'], cur)}"
-                       for r in failed)
+    items = [f"{r['sku']} (line {r['line']}) at {_fmt_rate(r['po_unit_price'], cur)}" for r in failed]
+    rebill = items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
     po_lines = " and ".join(f"line {r['po_line_id']} ({r['sku']})" for r in failed)
-    action = (f"Do not pay. Ask {ctx['vendor']['legal_name']} to re-bill {rebill} at the PO prices, or ask the buyer "
+    action = (f"Do not pay. Ask {ctx['vendor']['legal_name']} to re-bill at the PO price{'s' if len(items) > 1 else ''}: "
+              f"{rebill}, or ask the buyer "
               f"to approve new prices on {po['po_id']} {po_lines}. Do not accept the lines netted against each other.")
     raise _Stop("HOLD", "PRICE_VARIANCE", reason, action, review_field=f"line {failed[0]['line']} unit_price")
 

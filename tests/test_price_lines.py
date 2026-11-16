@@ -48,7 +48,7 @@ def test_offsetting_line_prices_hold_with_every_failed_line():
     assert "line 1 AAA at USD 157.50 vs PO USD 150.00 (+5.00%, +USD 75.00 at 10 units)" in d.reason
     assert "line 2 BBB at USD 46.25 vs PO USD 50.00 (-7.50%, -USD 75.00 at 20 units)" in d.reason
     assert "The differences offset" in d.reason and "Tax USD 250.00 is separate" in d.reason
-    assert "AAA (line 1) at USD 150.00, BBB (line 2) at USD 50.00" in d.next_action
+    assert "re-bill at the PO prices: AAA (line 1) at USD 150.00 and BBB (line 2) at USD 50.00, or ask" in d.next_action
     assert "line 10 (AAA) and line 20 (BBB)" in d.next_action
     assert d.review_field == "line 1 unit_price"
     assert [c["status"] for c in d.checks if c["rule"] == "price"] == ["fail", "fail"]
