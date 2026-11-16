@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="grid2">
+  <div class="card">
+    <h2>1. Procurement data</h2>
+    {% if ws %}
+      <p class="muted">Active workspace <code>{{ ws.workspace_id }}</code>: {{ ws.vendors }} vendor(s), {{ ws.pos }} PO(s), {{ ws.lines }} PO line(s).</p>
+    {% else %}
+      <p class="warn">No procurement data yet. Import the three CSVs first.</p>
+    {% endif %}
+    <form id="import-form">
+      <label>vendors.csv <input type="file" name="vendors" accept=".csv" required></label>
+      <label>purchase_orders.csv <input type="file" name="purchase_orders" accept=".csv" required></label>
+      <label>po_lines.csv <input type="file" name="po_lines" accept=".csv" required></label>
+      <button type="submit">Import into a new workspace</button>
+    </form>
+    <div id="import-result" class="result"></div>
+  </div>
+  <div class="card">
+    <h2>2. Submit an invoice PDF</h2>
+    <form id="upload-form">
+      <label>Invoice PDF <input type="file" name="file" accept="application/pdf,.pdf" required></label>
+      <button type="submit" {% if not ws %}disabled{% endif %}>Upload and process</button>
+    </form>
+    <div id="upload-result" class="result"></div>
+  </div>
+</section>
+<section class="card">
+  <h2>Recent runs</h2>
+  <div id="recent">Loading…</div>
+</section>
+{% endblock %}
+{% block scripts %}<script>initHome();</script>{% endblock %}

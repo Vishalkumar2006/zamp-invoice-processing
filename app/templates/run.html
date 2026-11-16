@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Run {{ run_id }}{% endblock %}
+{% block content %}
+<div class="runhead">
+  <h1>Run <code>{{ run_id }}</code></h1>
+  <span id="status" class="pill">…</span>
+  <span id="timing" class="muted"></span>
+</div>
+<section class="split">
+  <div class="left">
+    <div class="card"><h2>Stages</h2><ol id="stages" class="stages"></ol></div>
+    <div class="card" id="decision-card" hidden>
+      <h2>Decision</h2>
+      <div id="decision"></div>
+    </div>
+    <div class="card" id="balance-card" hidden><h2>PO balance</h2><div id="balance"></div></div>
+    <div class="card" id="evidence-card" hidden><h2>Extracted fields and evidence</h2><div id="evidence"></div></div>
+    <div class="card" id="checks-card" hidden><h2>Rule checks</h2><div id="checks"></div></div>
+  </div>
+  <div class="right card">
+    <h2>Original PDF</h2>
+    <iframe id="pdf" title="Invoice PDF" src="/runs/{{ run_id }}/pdf"></iframe>
+  </div>
+</section>
+{% endblock %}
+{% block scripts %}<script>initRun({{ run_id|tojson }});</script>{% endblock %}

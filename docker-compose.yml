@@ -1,0 +1,22 @@
+services:
+  app:
+    build: .
+    image: zamp-invoice-processing:latest
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+      # Set APP_PASSWORD (and optionally APP_USERNAME, default "ap") to require HTTP basic auth.
+      APP_USERNAME: ${APP_USERNAME:-}
+      APP_PASSWORD: ${APP_PASSWORD:-}
+    volumes:
+      - zamp_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  zamp_data:

@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# Local runtime data (database, uploaded PDFs)
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite*
+
+# Private assignment material and fixtures: never commit
+*.pdf
+*.csv
+expected.json
+01-*/
+
+# Secrets and local tool/editor files
+.env
+.env.*
+.claude/
+CLAUDE.md
+.vscode/
+.idea/
