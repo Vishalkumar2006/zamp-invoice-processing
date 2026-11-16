@@ -15,7 +15,8 @@ its evidence:
 Current checkpoint: **Milestone 1** (the vertical slice: procurement import, upload and job lifecycle, native and OCR
 extraction with page-level evidence, exact vendor and PO matching, atomic allocation, live and history views) plus
 the **cumulative-overbilling** hold (a later invoice that, together with earlier accepted invoices, exceeds the PO)
-and **duplicate resubmission** handling (a re-sent or scanned copy of an accepted invoice).
+**duplicate resubmission** handling (a re-sent or scanned copy of an accepted invoice), and **ambiguous PO**
+explanations (no PO printed, several open POs fit).
 
 ## Run it
 
@@ -99,10 +100,21 @@ upload ─► persist PDF + run (QUEUED) ─► worker claims run
   anything differs, it's `HOLD / DUPLICATE_NUMBER_CONFLICT`, naming the conflicting fields. A different verified
   number goes through the normal PO and authorization checks, even with the same vendor, PO and amount. To fail
   closed on uncertain identity, a number read by OCR that differs from an accepted number only by characters OCR
-  often confuses (O/0, I/1, S/5, B/8, Z/2) is held as `DUPLICATE_IDENTITY_UNCERTAIN`. The comparison is stored
+  often confuses (O/0, I/1, S/5, B/8, Z/2) is held as `DUPLICATE_IDENTITY_UNCERTAIN`. That applies when the
+  verified date and billing details corroborate a possible copy, or when the evidence is mixed. A confidently read
+  number with a *later* invoice date *and* different billing details (amounts, lines, currency or PO) is treated as
+  a separate invoice. It goes through the normal checks, and the near match is recorded with the decision. The comparison is stored
   with the decision and shown in the run view, with a link to the accepted invoice. The lookup runs inside the
   same `BEGIN IMMEDIATE` transaction as the allocation, and the database rejects a second allocation for the same
   vendor and invoice number. If that ever fired, finalization re-evaluates against fresh state instead of failing.
+- **Missing printed PO.** Every PO of the approved vendor is compared with the verified invoice lines: OPEN status,
+  same currency, each SKU present, unit price within 1%, quantity and net within the line's remaining authorization,
+  and net within the PO's remaining authorization. Each result carries its CSV source row. Two or more fitting
+  POs give `HOLD / PO_AMBIGUOUS`. Exactly one gives `HOLD / PO_MISSING`, a suggestion that is never assigned
+  automatically. None gives `HOLD / PO_MISSING_NO_MATCH`. No PO is selected and nothing is allocated. If the invoice
+  prints a delivery reference and it reads at confidence 80 or above, it's included in the next action (ask
+  procurement which PO covers that delivery). The run view shows the candidates side by side. Everything is stored
+  with the decision.
 - **Money** is stored as integer cents. Rates, quantities and tolerance use `Decimal`.
 - **Ledger safety** (`app/ledger.py`): `finalize` runs in one `BEGIN IMMEDIATE` transaction. It rereads state, returns
   the existing decision unchanged if the run is already decided, and retries on lock contention with a bound. The
@@ -137,6 +149,10 @@ supplied sample. They cover:
   same-amount recurrence (`READY`), same-key conflicts on date or amount (`HOLD` naming the fields), a corrected
   resubmission after a hold, a race between two runs for the same business invoice (one allocation), and older
   stored decisions that still render;
+- missing PO: several, one or no fitting candidates, a price within tolerance, a valid explicit PO among several,
+  a low-confidence delivery reference, and an ambiguous invoice over HTTP that leaves the ledger byte-identical;
+- OCR near matches: a scan whose look-alike number corroborates a copy (held), and a scan with a distinct number,
+  later date and new amounts (accepted);
 - OCR on a rotated, image-only scan. The scan is drawn with the font bundled in Pillow (pinned), not rendered
   from a non-embedded-font PDF, so the test input is the same on every host. Rendering through Poppler depended
   on host fonts: with none installed, Poppler 26 produced a blank page.

@@ -66,3 +66,6 @@ tr.fail td { background: var(--hold-bg); }
 }
 .sub { font-size: 13px; margin: 14px 0 4px; }
 tr.fail td strong { color: var(--blocked); }
+table.cands th { vertical-align: top; }
+table.cands td.bad { background: var(--hold-bg); }
+table.cands th.fit { color: var(--ready); }

@@ -74,6 +74,8 @@ class ExtractedInvoice(BaseModel):
     invoice_number: Field_ = Field(default_factory=Field_)
     invoice_date: Field_ = Field(default_factory=Field_)  # value: ISO date
     po_reference: Field_ = Field(default_factory=Field_)
+    # Informational: a delivery note / delivery reference printed on the invoice (never used to allocate).
+    delivery_reference: Field_ = Field(default_factory=Field_)
     currency: Field_ = Field(default_factory=Field_)
     net: Field_ = Field(default_factory=Field_)  # cents
     tax: Field_ = Field(default_factory=Field_)  # cents
@@ -109,4 +111,6 @@ class Decision(BaseModel):
     authorization: Optional[dict[str, Any]] = None
     # Business-key lookup (vendor + printed invoice number) and the field comparison with the accepted invoice.
     duplicate: Optional[dict[str, Any]] = None
+    # Missing printed PO: every vendor PO compared against the verified invoice lines at decision time.
+    po_candidates: Optional[dict[str, Any]] = None
     policy_version: str

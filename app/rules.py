@@ -68,7 +68,7 @@ def po_balance(snap: Snapshot, po_id: str) -> dict[str, Any]:
 def evaluate(inv: ExtractedInvoice, snap: Snapshot, *, min_conf: float, policy_version: str) -> Decision:
     checks: list[dict[str, Any]] = []
     ctx: dict[str, Any] = {"vendor": None, "po": None, "candidates": [], "prior": [], "authorization": None,
-                           "reason_codes": [], "duplicate": None}
+                           "reason_codes": [], "duplicate": None, "po_candidates": None}
 
     def check(rule: str, ok: bool, detail: str, **compared: Any) -> bool:
         checks.append({"rule": rule, "status": "pass" if ok else "fail", "detail": detail, "compared": compared})
@@ -93,7 +93,7 @@ def evaluate(inv: ExtractedInvoice, snap: Snapshot, *, min_conf: float, policy_v
             po_id=ctx["po"]["po_id"] if ctx["po"] else None, candidate_po_ids=ctx["candidates"],
             checks=checks, prior_allocations=ctx["prior"], review_field=stop.review_field,
             reason_codes=ctx["reason_codes"] or [stop.code], authorization=ctx["authorization"],
-            duplicate=ctx["duplicate"],
+            duplicate=ctx["duplicate"], po_candidates=ctx["po_candidates"],
             policy_version=policy_version,
         )
     cur = po["currency"]
@@ -186,6 +186,20 @@ def _ocr_canonical(number: str) -> str:
     return number.upper().translate(_OCR_CONFUSABLE)
 
 
+_BILLING_FIELDS_EXCLUDED = {"invoice_date"}
+
+
+def _clearly_distinct(inv: ExtractedInvoice, a: dict[str, Any], comparison: list[dict[str, Any]]) -> bool:
+    """An OCR near match is a separate invoice only with clear evidence: a later verified invoice
+    date AND at least one different billing detail (amounts, lines, currency or PO). Anything less
+    (same date, or identical billing) stays uncertain and fails closed."""
+    acc_date, inc_date = a.get("invoice_date"), inv.invoice_date.value
+    later = bool(acc_date and inc_date and inc_date > acc_date)
+    billing_differs = any(r["status"] == "conflict" and r["field"] not in _BILLING_FIELDS_EXCLUDED
+                          for r in comparison)
+    return later and billing_differs
+
+
 def _accepted_record(a: dict[str, Any]) -> dict[str, Any]:
     return {"run_id": a["run_id"], "allocation_id": a.get("id"), "invoice_number": a["invoice_number_norm"],
             "invoice_date": a.get("invoice_date"), "accepted_at": a.get("created_at"), "po_id": a["po_id"],
@@ -245,18 +259,27 @@ def _duplicate(inv, snap: Snapshot, vendor, check, ctx) -> None:
         ev = inv.invoice_number.evidence
         if ev is not None and ev.method == "ocr":
             near = [a for a in accepted if _ocr_canonical(a["invoice_number_norm"]) == _ocr_canonical(key)]
-            if near:
-                a = near[0]
-                dup.update(accepted=_accepted_record(a), comparison=_compare_with_accepted(inv, a),
-                           outcome="identity_uncertain")
+            for a in near:
+                comparison = _compare_with_accepted(inv, a)
+                if _clearly_distinct(inv, a, comparison):
+                    # A confidently read, different number backed by a later date and different
+                    # billing details is a separate invoice: record why, then run the normal checks.
+                    dup.setdefault("near_matches", []).append(
+                        {"accepted": _accepted_record(a), "comparison": comparison, "outcome": "distinct"})
+                    continue
+                dup.update(accepted=_accepted_record(a), comparison=comparison, outcome="identity_uncertain")
                 ctx["po"] = snap.pos.get(a["po_id"])  # the PO the accepted invoice was allocated to
                 ctx["prior"] = [{"run_id": a["run_id"], "invoice_number_norm": a["invoice_number_norm"],
                                  "po_id": a["po_id"], "net_cents": a["net_cents"], "gross_cents": a["gross_cents"]}]
                 check("duplicate", False, f"OCR read {key!r}; accepted {a['invoice_number_norm']!r} differs only by "
                       f"OCR-confusable characters", accepted_run=a["run_id"])
+                same = [r["field"] for r in comparison if r["status"] == "match"]
+                diff = [r["field"] for r in comparison if r["status"] == "conflict"]
                 raise _Stop("HOLD", "DUPLICATE_IDENTITY_UNCERTAIN",
                             f"The scanned invoice number {key!r} differs from accepted invoice "
-                            f"{a['invoice_number_norm']!r} (run {a['run_id']}) only by characters OCR often confuses.",
+                            f"{a['invoice_number_norm']!r} (run {a['run_id']}) only by characters OCR often confuses, "
+                            f"and the document does not clearly differ (matching: {', '.join(same) or 'none'}"
+                            + (f"; differing: {', '.join(diff)}" if diff else "") + ").",
                             f"Compare the printed invoice number on the PDF with {a['invoice_number_norm']}. If it is "
                             f"the same invoice, close this as a duplicate; if not, confirm the number and re-submit.",
                             review_field="invoice_number")
@@ -298,17 +321,116 @@ def _duplicate(inv, snap: Snapshot, vendor, check, ctx) -> None:
                 review_field="invoice_" + ("date" if conflicts[0]["field"] == "invoice_date" else "number"))
 
 
+def _candidate_evidence(inv: ExtractedInvoice, snap: Snapshot, po: dict[str, Any], vendor) -> dict[str, Any]:
+    """Compare one vendor PO with the verified invoice lines. Pure; used only to explain a hold."""
+    bal = po_balance(snap, po["po_id"])
+    by_sku = {pl["sku"]: pl for pl in snap.po_lines.get(po["po_id"], [])}
+    bal_lines = {b["line_id"]: b for b in bal["lines"]}
+    failures: list[str] = []
+    if po["status"] != "OPEN":
+        failures.append(f"status is {po['status']}")
+    if po["currency"] != inv.currency.value:
+        failures.append(f"currency {po['currency']} vs invoice {inv.currency.value}")
+    lines = []
+    for i, line in enumerate(inv.lines, start=1):
+        sku = line.sku.value
+        pl = by_sku.get(sku)
+        row: dict[str, Any] = {"invoice_line": i, "sku": sku, "invoice_quantity": line.quantity.value,
+                               "invoice_unit_price": line.unit_price.value, "invoice_amount_cents": line.amount.value,
+                               "po_line_id": None, "source": None}
+        if pl is None:
+            row.update(sku_ok=False, price_ok=False, quantity_ok=False, amount_ok=False)
+            failures.append(f"no {sku} line")
+            lines.append(row)
+            continue
+        b = bal_lines[pl["line_id"]]
+        inv_rate, po_rate = Decimal(line.unit_price.value), Decimal(pl["unit_price"])
+        variance = abs(inv_rate - po_rate)
+        price_ok = variance <= po_rate * PRICE_TOLERANCE
+        qty = Decimal(line.quantity.value)
+        qty_ok = qty <= Decimal(b["remaining_quantity"])
+        amount_ok = line.amount.value <= b["remaining_net_cents"]
+        row.update(po_line_id=pl["line_id"], source=f"{pl['source_file']} row {pl['source_row']}", sku_ok=True,
+                   po_unit_price=pl["unit_price"],
+                   variance_pct=f"{(variance / po_rate * 100) if po_rate else Decimal(0):.2f}", price_ok=price_ok,
+                   authorized_quantity=b["authorized_quantity"], allocated_quantity=b["allocated_quantity"],
+                   remaining_quantity=b["remaining_quantity"], quantity_ok=qty_ok,
+                   remaining_net_cents=b["remaining_net_cents"], amount_ok=amount_ok)
+        if not price_ok:
+            failures.append(f"{sku} price {inv_rate} vs {po_rate} (over 1%)")
+        if not qty_ok:
+            failures.append(f"{sku} quantity {norm_decimal(qty)} > remaining {b['remaining_quantity']}")
+        if not amount_ok:
+            failures.append(f"{sku} amount exceeds remaining {fmt_cents(b['remaining_net_cents'], po['currency'])}")
+        lines.append(row)
+    total_ok = inv.net.value <= bal["remaining_net_cents"]
+    if not total_ok:
+        failures.append(f"net {fmt_cents(inv.net.value, po['currency'])} exceeds remaining "
+                        f"{fmt_cents(bal['remaining_net_cents'], po['currency'])}")
+    return {
+        "po_id": po["po_id"], "vendor_id": po["vendor_id"], "status": po["status"], "currency": po["currency"],
+        "issued_on": po.get("issued_on"), "description": po.get("description", ""),
+        "source": f"{po['source_file']} row {po['source_row']}",
+        "authorized_net_cents": bal["authorized_net_cents"], "allocated_net_cents": bal["allocated_net_cents"],
+        "remaining_net_cents": bal["remaining_net_cents"], "allocation_count": bal["allocation_count"],
+        "incoming_net_cents": inv.net.value, "total_ok": total_ok, "lines": lines,
+        "viable": not failures, "failures": failures,
+    }
+
+
+def _missing_po(inv, snap: Snapshot, vendor, check, ctx) -> None:
+    """No printed PO: explain every PO of this vendor against the verified invoice lines, then hold.
+
+    Never selects a PO. One fitting candidate is a suggestion; two or more is an ambiguity."""
+    cands = [_candidate_evidence(inv, snap, po, vendor)
+             for po in sorted(snap.pos.values(), key=lambda p: p["po_id"]) if po["vendor_id"] == vendor["vendor_id"]]
+    viable = [c["po_id"] for c in cands if c["viable"]]
+    dn = inv.delivery_reference
+    delivery = None
+    if dn.value and dn.evidence is not None and dn.evidence.conf >= 80:  # same floor as critical fields
+        delivery = dn.value
+    ctx["candidates"] = viable
+    ctx["po_candidates"] = {
+        "delivery_reference": delivery,
+        "delivery_reference_evidence": dn.evidence.model_dump() if dn.evidence is not None else None,
+        "invoice_lines": [{"line": i, "sku": l.sku.value, "quantity": l.quantity.value, "unit_price": l.unit_price.value,
+                           "amount_cents": l.amount.value} for i, l in enumerate(inv.lines, start=1)],
+        "invoice_net_cents": inv.net.value, "currency": inv.currency.value,
+        "criteria": "approved vendor, OPEN status, same currency, every invoice SKU on the PO, unit price within 1%, "
+                    "quantity and net within remaining authorization",
+        "candidates": cands, "viable_po_ids": viable,
+    }
+    for c in cands:
+        check("po_candidate", c["viable"], f"{c['po_id']}: " + ("fits every criterion" if c["viable"]
+                                                                 else "; ".join(c["failures"])),
+              po_id=c["po_id"], source=c["source"])
+    dn_text = f" for delivery {delivery}" if delivery else ""
+    lines_text = ", ".join(f"{l.quantity.value} x {l.sku.value} at {l.unit_price.value}" for l in inv.lines)
+    if len(viable) >= 2:
+        raise _Stop("HOLD", "PO_AMBIGUOUS",
+                    f"No PO is printed on the invoice and {len(viable)} open POs for {vendor['legal_name']} fit it "
+                    f"equally ({', '.join(viable)}): each covers {lines_text} within its remaining authorization. "
+                    f"The invoice does not say which one applies.",
+                    f"Ask procurement which PO covers this delivery{dn_text}: {' or '.join(viable)}. "
+                    f"Re-submit with the confirmed PO; nothing is allocated until then.",
+                    review_field="po_reference")
+    if len(viable) == 1:
+        raise _Stop("HOLD", "PO_MISSING",
+                    f"No PO is printed on the invoice. One open PO fits ({viable[0]}), but a missing PO is never "
+                    f"assigned automatically.",
+                    f"Ask procurement to confirm that {viable[0]} covers this delivery{dn_text}, then re-submit "
+                    f"with the PO.", review_field="po_reference")
+    why = "; ".join(f"{c['po_id']}: {', '.join(c['failures'])}" for c in cands) or "the vendor has no POs"
+    raise _Stop("HOLD", "PO_MISSING_NO_MATCH",
+                f"No PO is printed on the invoice and no PO for {vendor['legal_name']} fits it ({why}).",
+                f"Ask procurement which PO covers this delivery{dn_text}, or whether a new PO is needed.",
+                review_field="po_reference")
+
+
 def _po(inv, snap: Snapshot, vendor, check, ctx) -> dict[str, Any]:
     ref = inv.po_reference.value
     if ref is None:
-        cands = sorted(p["po_id"] for p in snap.pos.values()
-                       if p["vendor_id"] == vendor["vendor_id"] and p["status"] == "OPEN"
-                       and p["currency"] == inv.currency.value)
-        ctx["candidates"] = cands
-        check("po", False, "no PO reference printed", candidates=cands)
-        raise _Stop("HOLD", "PO_MISSING", "The invoice has no printed PO reference. "
-                    + (f"Candidate open POs for this vendor: {', '.join(cands)}." if cands else "No open PO found."),
-                    "Confirm the PO with the requester before allocation.", review_field="po_reference")
+        _missing_po(inv, snap, vendor, check, ctx)
     po = snap.pos.get(ref)
     if po is None:
         check("po", False, f"{ref} not in purchase orders", po_reference=ref)

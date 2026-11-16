@@ -156,3 +156,34 @@ def test_older_stored_decisions_stay_readable(client):
     assert again.status_code == 200 and again.json()["decision_detail"] == legacy
     assert client.get(f"/ui/runs/{run['run_id']}").status_code == 200
     assert client.get("/ui/history").status_code == 200
+
+
+NEAR_NATIVE = "HCR-54517"  # an OCR scan of "HCR-S4517" collapses to the same look-alike form
+NEAR_SCAN = "HCR-S4517"
+
+
+@pytest.mark.skipif(not (shutil.which("tesseract") and shutil.which("pdftoppm")), reason="needs Poppler/Tesseract")
+def test_scanned_near_match_that_corroborates_a_copy_is_held(client):
+    _import(client)
+    _submit(client, invoice_pdf(number=NEAR_NATIVE, **ONE))
+    scan = _submit(client, scan_pdf(invoice_items(number=NEAR_SCAN, **ONE)))
+    inv = scan["extraction"]["invoice"]
+    assert inv["invoice_number"]["value"] == NEAR_SCAN and inv["invoice_number"]["evidence"]["conf"] >= 80
+    assert scan["decision"] == "HOLD" and scan["reason_code"] == "DUPLICATE_IDENTITY_UNCERTAIN"
+    assert scan["decision_detail"]["duplicate"]["accepted"]["invoice_number"] == NEAR_NATIVE
+    assert scan["allocation_id"] is None and _ledger(client) == (1, 596000)
+
+
+@pytest.mark.skipif(not (shutil.which("tesseract") and shutil.which("pdftoppm")), reason="needs Poppler/Tesseract")
+def test_scanned_distinct_number_with_later_date_and_new_billing_proceeds(client):
+    _import(client)
+    _submit(client, invoice_pdf(number=NEAR_NATIVE, date="March 4, 2026", **ONE))
+    later = scan_pdf(invoice_items(number=NEAR_SCAN, date="April 4, 2026",
+                                   lines=(("CAL-STD", "Standard calibration", "5", "$250.00", "$1,250.00"),),
+                                   subtotal="$1,250.00", total="$1,250.00"))
+    run = _submit(client, later)
+    assert run["extraction"]["invoice"]["invoice_number"]["value"] == NEAR_SCAN
+    assert run["decision"] == "READY", (run["reason_code"], run["reason"])
+    nm = run["decision_detail"]["duplicate"]["near_matches"][0]
+    assert nm["outcome"] == "distinct" and nm["accepted"]["invoice_number"] == NEAR_NATIVE
+    assert _ledger(client) == (2, 696000 - 100000 - 125000)

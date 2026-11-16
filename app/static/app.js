@@ -84,6 +84,7 @@ function renderDecision(run, d) {
       extraCodes.length ? ` + ${esc(extraCodes.join(", "))}` : ""}</span></div>
     <p>${esc(d.reason)}</p>
     ${renderDuplicate(d)}
+    ${renderCandidates(d)}
     ${renderAuthorization(run, d)}
     <dl class="kv">
       <dt>Next action</dt><dd><strong>${esc(d.next_action)}</strong></dd>
@@ -130,6 +131,49 @@ function renderDuplicate(d) {
     </dl>
     <div class="tablewrap"><table><thead><tr><th>Field</th><th>This document</th><th>Accepted invoice</th><th>Result</th></tr></thead>
       <tbody>${rows}</tbody></table></div>`;
+}
+
+// Missing printed PO: every vendor PO compared with the invoice lines, side by side, as recorded.
+function renderCandidates(d) {
+  const pc = d.po_candidates;
+  if (!pc || !pc.candidates || !pc.candidates.length) return "";
+  const cur = pc.currency;
+  const cs = pc.candidates;
+  const ok = (v) => (v ? "✓" : "✗");
+  const cell = (c, html, good) => `<td class="${good === false ? "bad" : ""}">${html}</td>`;
+  const row = (label, fn) => `<tr><th>${label}</th>${cs.map(fn).join("")}</tr>`;
+  const lineRows = pc.invoice_lines.map((il, idx) => {
+    const L = (c) => c.lines[idx] || {};
+    return [
+      row(`Line ${il.line}: SKU ${esc(il.sku)}`, (c) => cell(c, L(c).sku_ok
+        ? `${ok(true)} PO line ${esc(L(c).po_line_id)}<br><span class="muted">${esc(L(c).source)}</span>`
+        : `${ok(false)} not on PO`, L(c).sku_ok)),
+      row(`Unit price ${esc(il.unit_price)}`, (c) => cell(c, L(c).sku_ok
+        ? `${ok(L(c).price_ok)} PO ${esc(L(c).po_unit_price)} (${esc(L(c).variance_pct)}%)` : "—", L(c).price_ok)),
+      row(`Quantity ${esc(il.quantity)}`, (c) => cell(c, L(c).sku_ok
+        ? `${ok(L(c).quantity_ok)} ${esc(L(c).remaining_quantity)} left of ${esc(L(c).authorized_quantity)}` : "—",
+        L(c).quantity_ok)),
+      row(`Amount ${money(il.amount_cents, cur)}`, (c) => cell(c, L(c).sku_ok
+        ? `${ok(L(c).amount_ok)} ${money(L(c).remaining_net_cents, cur)} left on line` : "—", L(c).amount_ok)),
+    ].join("");
+  }).join("");
+  const viable = new Set(pc.viable_po_ids);
+  const head = cs.map((c) => `<th class="${viable.has(c.po_id) ? "fit" : ""}">${esc(c.po_id)}<br>
+    <span class="muted">${viable.has(c.po_id) ? "fits" : "does not fit"}</span></th>`).join("");
+  return `<h3 class="sub">PO candidates (no PO printed on the invoice)</h3>
+    <p class="muted">Compared at decision time on: ${esc(pc.criteria)}.
+      ${pc.delivery_reference ? `Delivery reference on the invoice: <strong>${esc(pc.delivery_reference)}</strong>.` : "No delivery reference could be read reliably."}
+      None of these POs is selected.</p>
+    <div class="tablewrap"><table class="cands"><thead><tr><th></th>${head}</tr></thead><tbody>
+      ${row("Source", (c) => `<td>${esc(c.source)}</td>`)}
+      ${row("Description", (c) => `<td>${esc(c.description)}<br><span class="muted">issued ${esc(c.issued_on || "—")}</span></td>`)}
+      ${row("Status / currency", (c) => cell(c, `${esc(c.status)} · ${esc(c.currency)}`, c.status === "OPEN" && c.currency === cur))}
+      ${lineRows}
+      ${row(`Invoice net ${money(pc.invoice_net_cents, cur)}`, (c) => cell(c,
+        `${ok(c.total_ok)} ${money(c.remaining_net_cents, c.currency)} left of ${money(c.authorized_net_cents, c.currency)}
+         (${esc(c.allocation_count)} allocation(s))`, c.total_ok))}
+      ${row("Result", (c) => `<td>${c.viable ? "<strong>fits every criterion</strong>" : esc(c.failures.join("; "))}</td>`)}
+    </tbody></table></div>`;
 }
 
 // Cap comparisons exactly as recorded with the decision (not the live ledger).
@@ -185,7 +229,7 @@ function renderEvidence(x) {
   const inv = x.invoice;
   const cur = inv.currency.value;
   const fields = [["Supplier", "supplier_name"], ["Invoice number", "invoice_number"], ["Invoice date", "invoice_date"],
-    ["PO reference", "po_reference"], ["Currency", "currency"], ["Net / subtotal", "net"], ["Tax", "tax"], ["Total", "gross"]];
+    ["PO reference", "po_reference"], ["Delivery reference", "delivery_reference"], ["Currency", "currency"], ["Net / subtotal", "net"], ["Tax", "tax"], ["Total", "gross"]];
   const val = (k, f) => {
     if (f.value === null || f.value === undefined) return `<span class="muted">${esc(f.note || "—")}</span>`;
     return ["net", "tax", "gross"].includes(k) ? money(f.value, cur) : esc(f.value);
@@ -194,7 +238,7 @@ function renderEvidence(x) {
     const conf = p.mean_conf !== null ? ` (mean conf ${p.mean_conf}, skew ${p.skew_slope})` : "";
     return `page ${p.page}: ${p.method.toUpperCase()}${conf}, ${p.duration_ms} ms`;
   }).join("; ");
-  const frows = fields.map(([label, k]) => `<tr><td>${label}</td><td>${val(k, inv[k])}</td><td>${evidenceCell(inv[k])}</td></tr>`).join("");
+  const frows = fields.map(([label, k]) => `<tr><td>${label}</td><td>${val(k, inv[k] || {})}</td><td>${evidenceCell(inv[k])}</td></tr>`).join("");
   const lrows = inv.lines.map((l) => `<tr><td>${esc(l.sku.value)}</td><td>${esc(l.description.value)}</td>
     <td class="num">${esc(l.quantity.value)}</td><td class="num">${esc(l.unit_price.value)}</td><td class="num">${money(l.amount.value, cur)}</td></tr>
     <tr><td colspan="5">qty ${evidenceCell(l.quantity)}<br>amount ${evidenceCell(l.amount)}</td></tr>`).join("");

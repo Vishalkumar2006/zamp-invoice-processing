@@ -336,6 +336,31 @@ class InvoiceParser:
         else:
             self.inv.issues.append("currency: no currency code or symbol found")
 
+    _DELIVERY_RE = re.compile(
+        r"deliver(?:y)?\s*(?:note|ref(?:erence)?\.?|receipt)\s*(?:no\.?|number|#)?\s*[:#]?\s*"
+        r"(?P<ref>[A-Z]{1,6}[-/]?\d[A-Z0-9/-]*)", re.IGNORECASE)
+
+    def _delivery_reference(self) -> None:
+        """Delivery note reference, from a labelled phrase anywhere on the page. Tolerates words run
+        together by the PDF producer ("DeliveryreferenceDN-4410."). Informational only."""
+        found: list[tuple[str, list[Token]]] = []
+        for row in self.rows:
+            text = " ".join(t.text for t in row.tokens)
+            for m in self._DELIVERY_RE.finditer(text):
+                ref = m.group("ref").rstrip(".,;:-/")
+                toks = [t for t in row.tokens if ref.lower() in t.text.lower()]
+                if not toks:  # value split across tokens: keep the tokens that make up the phrase
+                    toks = row.tokens
+                found.append((norm_identifier(ref), toks))
+        if not found:
+            return
+        values = sorted({v for v, _ in found})
+        ref, toks = found[0]
+        f = Field_(raw=ref, value=ref, evidence=evidence_for(toks, "delivery reference"))
+        if len(values) > 1:
+            f.value, f.note = None, "conflicting delivery references: " + ", ".join(values)
+        self.inv.delivery_reference = f
+
     def _lines(self) -> None:
         header_idx = None
         cols: list[tuple[str, Segment]] = []
@@ -443,6 +468,7 @@ class InvoiceParser:
                          lambda r: (lambda c: (c, None) if c is not None else (None, "not a money amount"))(
                              parse_money_cents(r)))
         self._currency(labelled)
+        self._delivery_reference()
         self._lines()
         for key in ("invoice_number", "invoice_date", "net", "gross"):
             if getattr(self.inv, key).value is None and not getattr(self.inv, key).note:
