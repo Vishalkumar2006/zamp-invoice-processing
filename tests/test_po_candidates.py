@@ -50,7 +50,7 @@ def test_two_viable_candidates_are_ambiguous_and_nothing_is_selected():
         ln = c["lines"][0]
         assert (ln["sku_ok"], ln["price_ok"], ln["quantity_ok"], ln["amount_ok"]) == (True, True, True, True)
         assert ln["source"].startswith("po_lines.csv row ") and ln["remaining_quantity"] == "24"
-    assert "DN-4410" in d.next_action and "PO-A or PO-B" in d.next_action and "procurement" in d.next_action
+    assert d.next_action.startswith("Ask procurement which PO covers delivery DN-4410: PO-A or PO-B.")
     assert d.review_field == "po_reference"
 
 

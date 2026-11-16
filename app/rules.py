@@ -404,26 +404,26 @@ def _missing_po(inv, snap: Snapshot, vendor, check, ctx) -> None:
         check("po_candidate", c["viable"], f"{c['po_id']}: " + ("fits every criterion" if c["viable"]
                                                                  else "; ".join(c["failures"])),
               po_id=c["po_id"], source=c["source"])
-    dn_text = f" for delivery {delivery}" if delivery else ""
+    dn_text = f"delivery {delivery}" if delivery else "this delivery"
     lines_text = ", ".join(f"{l.quantity.value} x {l.sku.value} at {l.unit_price.value}" for l in inv.lines)
     if len(viable) >= 2:
         raise _Stop("HOLD", "PO_AMBIGUOUS",
                     f"No PO is printed on the invoice and {len(viable)} open POs for {vendor['legal_name']} fit it "
                     f"equally ({', '.join(viable)}): each covers {lines_text} within its remaining authorization. "
                     f"The invoice does not say which one applies.",
-                    f"Ask procurement which PO covers this delivery{dn_text}: {' or '.join(viable)}. "
+                    f"Ask procurement which PO covers {dn_text}: {' or '.join(viable)}. "
                     f"Re-submit with the confirmed PO; nothing is allocated until then.",
                     review_field="po_reference")
     if len(viable) == 1:
         raise _Stop("HOLD", "PO_MISSING",
                     f"No PO is printed on the invoice. One open PO fits ({viable[0]}), but a missing PO is never "
                     f"assigned automatically.",
-                    f"Ask procurement to confirm that {viable[0]} covers this delivery{dn_text}, then re-submit "
+                    f"Ask procurement to confirm that {viable[0]} covers {dn_text}, then re-submit "
                     f"with the PO.", review_field="po_reference")
     why = "; ".join(f"{c['po_id']}: {', '.join(c['failures'])}" for c in cands) or "the vendor has no POs"
     raise _Stop("HOLD", "PO_MISSING_NO_MATCH",
                 f"No PO is printed on the invoice and no PO for {vendor['legal_name']} fits it ({why}).",
-                f"Ask procurement which PO covers this delivery{dn_text}, or whether a new PO is needed.",
+                f"Ask procurement which PO covers {dn_text}, or whether a new PO is needed.",
                 review_field="po_reference")
 
 
