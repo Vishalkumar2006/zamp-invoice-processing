@@ -86,6 +86,7 @@ function renderDecision(run, d) {
     <div class="decision-big ${cls}">${esc(d.decision)} <span class="muted" style="font-size:13px">${esc(d.reason_code)}${
       extraCodes.length ? ` + ${esc(extraCodes.join(", "))}` : ""}</span></div>
     <p>${esc(d.reason)}</p>
+    ${renderRemittance(d)}
     ${renderDuplicate(d)}
     ${renderCandidates(d)}
     ${renderPrices(d)}
@@ -262,6 +263,25 @@ function renderBalance(bal, d) {
     ${thisInv}
     <table><thead><tr><th>Line</th><th>SKU</th><th class="num">Unit price</th><th class="num">Qty auth / used / left</th>
       <th class="num">Net auth</th><th class="num">Net used</th><th class="num">Net left</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function renderRemittance(d) {
+  const r = d.remittance;
+  if (!r || r.outcome === "consistent" || r.outcome === "notice_verified") return "";
+  const rows = r.comparison.map((c) => `<tr><td>${esc(c.label)}</td><td>${esc(c.invoice || "—")}</td>
+    <td>${esc(c.on_file || "none on file")}</td><td>${esc(c.status)}</td>
+    <td class="muted">${c.invoice_evidence ? `invoice p${esc(c.invoice_evidence.page)} · ${esc(c.invoice_evidence.method)}
+      · conf ${esc(c.invoice_evidence.conf)}` : "—"} / ${esc(c.on_file_source)}</td></tr>`).join("");
+  const n = r.change_notice;
+  const contact = r.verification_contact
+    ? `Verify by phone with the number in the vendor master: <strong>${esc(r.verification_contact.phone)}</strong>
+       (${esc(r.verification_contact.source)}). Do not use contact details printed on the invoice.`
+    : "No verification phone in the vendor master: ask procurement for a trusted contact.";
+  return `<h3 class="sub">Remittance details vs vendor master (identifiers masked)</h3>
+    <div class="tablewrap"><table><thead><tr><th>Field</th><th>Invoice</th><th>Vendor master</th><th>Result</th>
+    <th>Source</th></tr></thead><tbody>${rows}</tbody></table></div>
+    ${n ? `<p>Change notice on the invoice: “${esc(n.text)}” (page ${esc((n.evidence || {}).page)})</p>` : ""}
+    <p>${contact}</p>`;
 }
 
 function vendorMatch(d) {

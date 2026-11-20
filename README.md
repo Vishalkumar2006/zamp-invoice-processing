@@ -55,7 +55,7 @@ curl http://localhost:8000/ledger                                             # 
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/health` | DB and OCR tool check |
-| POST | `/procurement/import` | Three CSVs, validated together. Creates a new workspace, or returns 422 with every error. |
+| POST | `/procurement/import` | Three CSVs, validated together. Creates a new workspace, or returns 422 with every error. `vendors.csv` may add `bank_name`, `routing_number` (9 digits), `account_number` (4–17 digits) and `verification_phone` (or `phone_on_file`); identifiers are stored as text, so leading zeros survive. |
 | GET | `/procurement` | Imported rows with their source file and row |
 | POST | `/runs` | PDF upload. Stores the file and queues the run, then returns `202` with `run_id` and `workspace_id`. Optional form field `workspace_id` (the UI always sends it); omitted means the latest workspace; an unknown ID returns 422 and writes nothing. |
 | GET | `/runs` | Run history (`?workspace_id=` to scope) |
@@ -139,6 +139,16 @@ upload ─► persist PDF + run (QUEUED) ─► worker claims run
   `HOLD / DUPLICATE_IDENTITY_UNCERTAIN`, with both readings shown. Otherwise (a different reliable period, no
   period printed on either, or different billing) the variant is recorded and the normal checks run: the same
   vendor, PO and amount alone never make a duplicate.
+- **Remittance safeguard.** Printed payment instructions (bank name, routing and account numbers, with page and
+  position) and explicit change notices ("updated remittance details", "we have moved our banking") are compared
+  with the trusted bank data in the vendor master, right after the vendor is resolved. A verified mismatch
+  (read at confidence 80 or above, value on file) is `HOLD / REMITTANCE_MISMATCH`. A change notice holds as
+  `HOLD / REMITTANCE_CHANGE_UNVERIFIED` unless the printed account (and routing, if printed) fully matches the
+  vendor master. Ordinary instructions, including an unchanged masked account reference (`****1234`), keep the
+  normal workflow. The next action sends the reviewer to the vendor master's verification phone, or to procurement
+  for a trusted contact when none is on file, never to contact details printed on the invoice. Invoices never
+  change the vendor master. Full routing and account numbers stay in the database only; decisions, the API and the
+  UI show masked values (last four digits) with source references.
 - **Vendor names.** The exact normalized legal name always wins. With no exact match, a printed name that differs
   from one legal name only by a legal suffix on one side (`Acme Field Services` vs `Acme Field Services Inc.`) matches if it is
   unique across the whole vendor master and the remaining name has at least two words. Two candidates hold as
@@ -210,6 +220,13 @@ supplied sample. They cover:
   charge with the same amount, a resent copy with leading zeros (blocked when corroborated, held when re-dated or
   when either service period is read below confidence 80, normal checks without period corroboration), and the
   existing exact-number block;
+- remittance: vendor-master bank columns (leading zeros, masked in the API, legacy CSVs, `phone_on_file`, malformed
+  identifiers, migration of an existing database), extraction of payment instructions and change notices, a paired
+  invoice with identical figures that holds with changed bank details and is `READY` with matching ones, a change
+  notice without verifiable details, no verification phone (procurement), no instructions or no bank data on file
+  (normal workflow), and masked identifiers throughout the decision and the API;
+- a Case-3-style layout: an `INVOICE <id>` heading, `Merchandise` subtotal, `Ext.` amount column and an unlabelled
+  `Ln` column that no longer merges into the part number;
 - layout variants: `Invoice #:` and `Customer PO:` style labels, right-aligned figures under left-aligned headers,
   numbers inside descriptions, a missing or doubled quantity (held), and a two-shipment PO where the second
   shipment is held for exceeding one SKU's quantity and the PO total;

@@ -79,6 +79,13 @@ class ExtractedInvoice(BaseModel):
     # Printed service / billing period, e.g. value "2026-09" for "September 2026". Used to tell recurring
     # charges apart and to corroborate a resent copy; never used to allocate.
     service_period: Field_ = Field(default_factory=Field_)
+    # Payment instructions printed on the invoice (compared with the vendor master; never used to update it).
+    # Identifier values keep the printed form ("****7734" when masked); API output masks them.
+    remit_bank_name: Field_ = Field(default_factory=Field_)
+    remit_routing: Field_ = Field(default_factory=Field_)
+    remit_account: Field_ = Field(default_factory=Field_)
+    # An explicit notice that remittance details changed ("updated remittance details", "we have moved our banking").
+    remittance_notice: Field_ = Field(default_factory=Field_)
     currency: Field_ = Field(default_factory=Field_)
     net: Field_ = Field(default_factory=Field_)  # cents
     tax: Field_ = Field(default_factory=Field_)  # cents
@@ -122,4 +129,6 @@ class Decision(BaseModel):
     vendor_match: Optional[dict[str, Any]] = None
     # How each invoice line was mapped to a PO line: by printed SKU, or (SKU not printed) by verified description.
     line_matches: Optional[list[dict[str, Any]]] = None
+    # Printed remittance details compared with the vendor master (masked identifiers only), plus the trusted contact.
+    remittance: Optional[dict[str, Any]] = None
     policy_version: str

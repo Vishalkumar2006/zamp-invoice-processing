@@ -18,6 +18,9 @@ from .db import now_iso, transaction
 from .money import csv_money_cents, norm_decimal
 
 VENDOR_COLS = ["vendor_id", "legal_name", "status"]
+# Optional trusted remittance columns. "phone_on_file" is accepted as another name for "verification_phone".
+VENDOR_OPTIONAL_COLS = ["bank_name", "routing_number", "account_number", "verification_phone"]
+_VENDOR_ALIASES = {"phone_on_file": "verification_phone"}
 PO_COLS = ["po_id", "vendor_id", "issued_on", "status", "currency", "description", "authorized_net"]
 LINE_COLS = ["po_id", "line_id", "sku", "description", "authorized_quantity", "unit_price", "authorized_net"]
 
@@ -106,9 +109,19 @@ def validate(files: dict[str, tuple[str, bytes]]) -> Parsed:
             errors.append(f"{where}: duplicate vendor_id {r['vendor_id']}")
             continue
         seen_v.add(r["vendor_id"])
+        extra = {}
+        for col in VENDOR_OPTIONAL_COLS:
+            alias = next((a for a, c in _VENDOR_ALIASES.items() if c == col), None)
+            value = (r.get(col) or (r.get(alias) if alias else "") or "").strip()
+            extra[col] = value or None
+        # Identifiers stay strings so leading zeros survive; they must be plain digits.
+        if extra["routing_number"] and not re.fullmatch(r"\d{9}", extra["routing_number"]):
+            errors.append(f"{where}: routing_number must be 9 digits")
+        if extra["account_number"] and not re.fullmatch(r"\d{4,17}", extra["account_number"]):
+            errors.append(f"{where}: account_number must be 4 to 17 digits")
         out.vendors.append({"vendor_id": r["vendor_id"], "legal_name": r["legal_name"],
                             "legal_name_norm": norm_name(r["legal_name"]), "status": r["status"].upper(),
-                            "source_file": vf, "source_row": rn})
+                            "source_file": vf, "source_row": rn, **extra})
 
     seen_po: set[str] = set()
     for rn, r in _read(pc, pf, PO_COLS, errors):
@@ -179,7 +192,10 @@ def import_procurement(conn, files: dict[str, tuple[str, bytes]]) -> dict[str, A
         conn.execute("INSERT INTO workspaces (id, created_at, source_files_json) VALUES (?,?,?)",
                      (ws, now_iso(), json.dumps({role: f[0] for role, f in files.items()})))
         conn.executemany(
-            "INSERT INTO vendors VALUES (:ws,:vendor_id,:legal_name,:legal_name_norm,:status,:source_file,:source_row)",
+            "INSERT INTO vendors (workspace_id, vendor_id, legal_name, legal_name_norm, status, source_file, source_row,"
+            " bank_name, routing_number, account_number, verification_phone) VALUES (:ws,:vendor_id,:legal_name,"
+            ":legal_name_norm,:status,:source_file,:source_row,:bank_name,:routing_number,:account_number,"
+            ":verification_phone)",
             [{**v, "ws": ws} for v in parsed.vendors])
         conn.executemany(
             "INSERT INTO purchase_orders VALUES (:ws,:po_id,:vendor_id,:issued_on,:status,:currency,:description,"

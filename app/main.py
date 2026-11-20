@@ -24,6 +24,7 @@ from .extraction import tool_versions
 from .ledger import finalize, ledger_report, load_snapshot
 from .money import fmt_cents
 from .procurement import ImportError_, import_procurement
+from .remittance import redact_extraction, redact_vendor
 from .rules import po_balance
 from .worker import Worker, recover_interrupted
 
@@ -136,7 +137,7 @@ def _run_detail(conn, run_id: str) -> dict[str, Any]:
         "sha256": r["sha256"], "size_bytes": r["size_bytes"], "attempts": r["attempts"], "error": r["error"],
         "started_at": r["started_at"], "decided_at": r["decided_at"], "policy_version": r["policy_version"],
         "events": events,
-        "extraction": json.loads(r["extraction_json"]) if r["extraction_json"] else None,
+        "extraction": redact_extraction(json.loads(r["extraction_json"])) if r["extraction_json"] else None,
         "decision_detail": json.loads(r["decision_json"]) if r["decision_json"] else None,
         "pdf_url": f"/runs/{run_id}/pdf",
     })
@@ -184,7 +185,8 @@ def procurement(workspace_id: Optional[str] = None) -> dict[str, Any]:
         if not ws:
             raise HTTPException(404, "no procurement data imported")
         snap = load_snapshot(conn, ws)
-        return {"workspace_id": ws, "vendors": snap.vendors, "purchase_orders": list(snap.pos.values()),
+        return {"workspace_id": ws, "vendors": [redact_vendor(v) for v in snap.vendors],
+                "purchase_orders": list(snap.pos.values()),
                 "po_lines": [l for ls in snap.po_lines.values() for l in ls]}
 
 

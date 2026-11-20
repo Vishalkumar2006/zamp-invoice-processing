@@ -16,6 +16,7 @@ from typing import Callable, Iterable, Optional
 
 from ..models import Evidence, ExtractedInvoice, Field_, LineItem, Token
 from ..money import norm_decimal, parse_decimal_amount, parse_money_cents, parse_quantity
+from ..remittance import digits as _digits
 
 
 # ----------------------------------------------------------------------------- geometry
@@ -135,7 +136,8 @@ LABELS: dict[str, re.Pattern[str]] = {
     "po_reference": re.compile(
         r"^((customer|client|buyer|your) )?"
         r"(purchase order( (number|no\.?|#|ref(erence)?))?|p\.?o\.?( (number|no\.?|#|ref(erence)?))?)$"),
-    "net": re.compile(r"^(sub ?total|net( total| amount)?|total before tax|subtotal \(excl\.? tax\))" + _CUR + "$"),
+    "net": re.compile(r"^(sub ?total|net( total| amount)?|total before tax|subtotal \(excl\.? tax\)|merchandise( total)?)"
+                      + _CUR + "$"),
     "tax": re.compile(r"^((sales )?tax|vat|gst)( \(?[\d.]+ ?%\)?)?" + _CUR + "$"),
     "gross": re.compile(r"^((grand |invoice )?total( due| amount)?|(amount|balance) due)" + _CUR + "$"),
     "service_period": re.compile(r"^(service period|billing period|period of service|service dates?)$"),
@@ -149,6 +151,9 @@ LABELS = {k: re.compile(p.pattern.replace(" ", " ?")) for k, p in LABELS.items()
 OTHER_LABELS = re.compile(
     r"^((payment )?terms|payment due|due date|due|ship(ped)? to|bill(ed)? to|sold to|customer( (no\.?|id|number))?|"
     r"account( (no\.?|number))?|delivery note|reference|ref|page)$")
+
+
+_ID_LIKE = re.compile(r"[A-Za-z0-9][A-Za-z0-9/._-]*\d[A-Za-z0-9/._-]*")
 
 
 def _match_label(seg: Segment, include_other: bool = False) -> Optional[tuple[str, int, Optional[str]]]:
@@ -223,6 +228,22 @@ def parse_period(text: str) -> tuple[Optional[str], Optional[str]]:
 _NO_TAX = re.compile(r"^(not applicable|n/?a|none|nil|exempt|tax exempt|not taxable|no tax|zero rated)$")
 
 
+# Payment-instruction phrases. Only rows that carry a routing or account number are read as remittance details.
+_ROUTING_RE = re.compile(r"\b(?:ach\s+|aba\s+|wire\s+)?(?:routing|aba|rtn)(?:\s*(?:no\.?|number|#))?\s*[:#]?\s*"
+                         r"([0-9*xX•]{4,12})(?![0-9])", re.IGNORECASE)
+_ACCOUNT_RE = re.compile(r"\b(?:account|acct\.?|a/c)(?:\s*(?:no\.?|number|#))?\s*[:#]?\s*"
+                         r"([0-9*xX•][0-9*xX•-]{3,24})(?![0-9])", re.IGNORECASE)
+_BANK_WORD = re.compile(r"\b(bank|credit union|savings|bancorp)\b", re.IGNORECASE)
+_PART_SEP = re.compile(r"\s*[·•|;,]\s*|\s+[-–—]\s+")
+# Explicit notices that the remittance details changed. Ordinary "Remit to:" / "Pay by ACH:" lines are not notices.
+_CHANGE_NOTICE_RE = re.compile(
+    r"\b(updated|new|changed|revised)\s+(remittance|remit|banking|bank)\b"
+    r"|\b(updated|new|changed|revised)\s+(payment|account|ach|wire)\s+(details|information|instructions)\b"
+    r"|\bchange\s+(?:of|to|in)\s+(?:our\s+)?(bank|banking|remittance|account|payment)\b"
+    r"|\bmoved\s+our\s+bank(?:ing)?\b"
+    r"|\bbank(?:ing)?\s+(?:details|information|account)\s+(?:has|have)\s+changed\b", re.IGNORECASE)
+
+
 def norm_identifier(text: str) -> str:
     """Conservative ID normalisation: trim, uppercase, collapse inner spaces. Keeps leading
     zeros and punctuation; unifies dash variants."""
@@ -237,7 +258,8 @@ COLUMN_KEYS: dict[str, re.Pattern[str]] = {
     "description": re.compile(r"^(description|details|service|item description)$"),
     "quantity": re.compile(r"^(qty|quantity|hours|hrs|units)$"),
     "unit_price": re.compile(r"^(unit price|rate|price|unit cost|unit rate)( \([a-z]{3}\))?$"),
-    "amount": re.compile(r"^(amount|line total|total|net amount|net)( \([a-z]{3}\))?$"),
+    "amount": re.compile(r"^(amount|line total|total|net amount|net|ext|extended|ext(ended)? (amount|price)|extension)"
+                         r"( \([a-z]{3}\))?$"),
 }
 NUMERIC_COLS = ("quantity", "unit_price", "amount")
 
@@ -270,6 +292,12 @@ class InvoiceParser:
             consumed: set[int] = set()
             for i, seg in enumerate(row.segments):
                 if i in consumed:
+                    continue
+                # An "INVOICE <id>" heading: the bare word followed by exactly one ID-like token in the same cell.
+                # Kept out of LABELS so a lone "INVOICE" title is never a label ("TAX INVOICE", "Invoice 1 of 2").
+                if (len(seg.tokens) == 2 and _norm(seg.tokens[0].text) == "invoice"
+                        and _ID_LIKE.fullmatch(seg.tokens[1].text)):
+                    found.setdefault("invoice_number", []).append(([seg.tokens[1]], [seg.tokens[0]], None))
                     continue
                 m = _match_label(seg, include_other=True)
                 if not m:
@@ -383,6 +411,51 @@ class InvoiceParser:
             self.inv.issues[self.inv.issues.index(issue)] = (
                 f"tax: printed as {tax.raw!r} but the subtotal and total differ")
 
+    def _remittance(self) -> None:
+        """Printed payment instructions (bank name, routing and account numbers) and any explicit change notice,
+        each with its page and position. Informational for extraction: never blocks it; the rules compare the
+        values with the vendor master. Conflicting values across rows leave the field empty with a note."""
+        found: dict[str, list[tuple[str, list[Token]]]] = {"remit_bank_name": [], "remit_routing": [], "remit_account": []}
+        for row in self.rows:
+            text = " ".join(t.text for t in row.tokens)
+            hits = []
+            for key, rx in (("remit_routing", _ROUTING_RE), ("remit_account", _ACCOUNT_RE)):
+                for m in rx.finditer(text):
+                    value = re.sub(r"[-\s]", "", m.group(1))
+                    if len(_digits(value)) < 4:
+                        continue
+                    tail = _digits(value)[-4:]
+                    toks = [t for t in row.tokens if tail in t.text] or row.tokens
+                    hits.append((key, value, toks))
+            if not hits:
+                continue
+            found["remit_routing"] += [(v, t) for k, v, t in hits if k == "remit_routing"]
+            found["remit_account"] += [(v, t) for k, v, t in hits if k == "remit_account"]
+            for part in _PART_SEP.split(text):
+                if _BANK_WORD.search(part) and not re.search(r"\d", part):
+                    name = part.rsplit(":", 1)[-1].strip(" .")
+                    if name:
+                        words = name.split()
+                        toks = [t for t in row.tokens if t.text in words] or row.tokens
+                        found["remit_bank_name"].append((name, toks))
+        for key, cands in found.items():
+            if not cands:
+                continue
+            value, toks = cands[0]
+            label = {"remit_bank_name": "bank", "remit_routing": "routing", "remit_account": "account"}[key]
+            f = Field_(raw=value, value=value, evidence=evidence_for(toks, label))
+            distinct = {(c[0].upper() if key != "remit_bank_name" else _norm(c[0])) for c in cands}
+            if len(distinct) > 1:
+                f.value, f.note = None, f"{len(distinct)} different {label} values printed"
+            setattr(self.inv, key, f)
+        for row in self.rows:
+            text = " ".join(t.text for t in row.tokens)
+            m = _CHANGE_NOTICE_RE.search(text)
+            if m:
+                self.inv.remittance_notice = Field_(raw=text, value=m.group(0),
+                                                    evidence=evidence_for(row.tokens, "remittance change notice"))
+                break
+
     def _service_period(self, cands) -> None:
         """Informational: never blocks extraction. An unparsed period keeps its raw text and evidence."""
         if not cands:
@@ -435,8 +508,11 @@ class InvoiceParser:
         if header_idx is None:
             self.inv.issues.append("lines: no line-item table header found")
             return
-        cols.sort(key=lambda cs: cs[1].x0)
         header_row = self.rows[header_idx]
+        # Header cells we do not extract (e.g. "Ln", "UOM") still bound a column, so their contents are
+        # dropped instead of merging into the neighbouring column.
+        cols += [("_ignored", s) for s in header_row.segments if not _column_of(s)]
+        cols.sort(key=lambda cs: cs[1].x0)
         slack = 0.5 * statistics.median(t.h for t in header_row.tokens)
         text_cols = [(c, s) for c, s in cols if c not in NUMERIC_COLS]
 
@@ -548,6 +624,7 @@ class InvoiceParser:
                              parse_money_cents(r)))
         self._no_tax_wording()
         self._service_period(labelled.get("service_period", []))
+        self._remittance()
         self._currency(labelled)
         self._delivery_reference()
         self._lines()

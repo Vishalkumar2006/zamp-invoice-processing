@@ -24,6 +24,11 @@ CREATE TABLE IF NOT EXISTS vendors (
     status TEXT NOT NULL,
     source_file TEXT NOT NULL,
     source_row INTEGER NOT NULL,
+    -- Optional trusted remittance data from the vendor master (strings: leading zeros are significant).
+    bank_name TEXT,
+    routing_number TEXT,
+    account_number TEXT,
+    verification_phone TEXT,
     PRIMARY KEY (workspace_id, vendor_id)
 );
 
@@ -136,12 +141,20 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+VENDOR_REMITTANCE_COLUMNS = ("bank_name", "routing_number", "account_number", "verification_phone")
+
+
 def init_db() -> None:
     config.ensure_dirs()
     conn = connect()
     try:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
+        # Databases created before the remittance columns existed: add them (all nullable).
+        have = {r[1] for r in conn.execute("PRAGMA table_info(vendors)")}
+        for col in VENDOR_REMITTANCE_COLUMNS:
+            if col not in have:
+                conn.execute(f"ALTER TABLE vendors ADD COLUMN {col} TEXT")
     finally:
         conn.close()
 
