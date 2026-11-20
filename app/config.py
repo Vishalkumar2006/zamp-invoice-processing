@@ -8,7 +8,7 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "./data")).resolve()
 DB_PATH = DATA_DIR / "app.db"
 UPLOAD_DIR = DATA_DIR / "uploads"
 
-POLICY_VERSION = "ps1-policy-2026.11-m9"
+POLICY_VERSION = "ps1-policy-2026.11-m10"
 
 # Upload / extraction bounds.
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))

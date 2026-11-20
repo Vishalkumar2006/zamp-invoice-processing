@@ -122,6 +122,26 @@ upload ─► persist PDF + run (QUEUED) ─► worker claims run
   prints a delivery reference and it reads at confidence 80 or above, it's included in the next action (ask
   procurement which PO covers that delivery). The run view shows the candidates side by side. Everything is stored
   with the decision.
+- **Vendor part numbers on a missing-PO invoice.** When a printed part number is not a SKU on the PO, the line is
+  compared with the PO's lines by product identity and specifications. The PO line's identifying words (at least 2)
+  and its specifications (at least 1: sizes, grades, thread or model codes) must all appear in the invoice
+  description, with no conflicting qualifier. Generic trade abbreviations are expanded (`GR5` = grade 5,
+  `SS` = stainless), and extra invoice detail such as a finish is allowed. Across all such lines the mapping must
+  be one-to-one and unique. Quantity, unit price and remaining authorization are then checked as for a SKU. The
+  printed part number stays as printed, and the inferred PO line is recorded beside it. Ambiguous or missing line
+  evidence is reported, never resolved by guessing. A PO with the same total but different products is shown as
+  ineligible, with the words and specifications that rule it out. An explicit printed PO keeps SKU validation.
+- **Workspace settings (optional, per import).** `date_order` (`MDY` or `DMY`) reads numeric dates such as
+  `03/04/2026` in that order, keeping the raw text and a note; a date that is invalid in the configured order is
+  held, not reinterpreted. `default_currency` applies only when the invoice prints no currency code or symbol and is
+  recorded with source `workspace_config`; a printed currency always takes precedence. Unset (the default), ambiguous
+  dates and a missing currency hold as before.
+- **Totals block.** `MERCH` reads as the subtotal and `PAY THIS AMT` / `AMT DUE` as the total. A printed freight or
+  shipping charge (in the totals block) is read with its evidence: zero passes, a nonzero charge holds as
+  `TOTALS_MISMATCH` because only PO lines are authorized, and an unclear one is held by the evidence check. On a
+  missing-PO invoice the arithmetic is verified before any PO is suggested. An `EA` / `Each` header is the unit-price
+  column. A three-decimal rate such as `2.125` is read as a decimal when the document's own amounts use `.` as the
+  decimal mark (`1,250.00`).
 - **Unit prices, line by line.** Every mapped line is checked before the price decision: the invoice unit price must
   be within **1% (inclusive)** of its PO line price. If any line fails, the run is `HOLD / PRICE_VARIANCE` with
   zero allocations. Each line records the invoice and PO prices, the signed variance (for example `+5.00%`,
@@ -234,6 +254,10 @@ supplied sample. They cover:
   without a notice (`REMITTANCE_CONFLICT`, ledger and vendor master unchanged), the same account in three formats
   (`READY`), one clear reading among unclear copies, and contiguous, hyphenated and space-separated identifiers
   masked across the whole run response;
+- workspace settings and line evidence: MDY/DMY and default currency against unconfigured workspaces (held), a
+  printed currency winning over the default, a suggestion from product and specification evidence with an
+  equal-total PO shown as ineligible (no PO selected, ledger unchanged through a finalize retry), an equal total
+  alone, ambiguous line matches, two fitting POs, a price outside tolerance, a printed PO, and zero vs nonzero freight;
 - a Case-3-style layout: an `INVOICE <id>` heading, `Merchandise` subtotal, `Ext.` amount column and an unlabelled
   `Ln` column that no longer merges into the part number;
 - layout variants: `Invoice #:` and `Customer PO:` style labels, right-aligned figures under left-aligned headers,
@@ -248,9 +272,11 @@ supplied sample. They cover:
 
 ## Scope and assumptions
 
-- One invoice per PDF, one PO per invoice, USD only, explicit line amounts, lines matched by SKU.
+- One invoice per PDF, one PO per invoice, USD only, explicit line amounts, lines matched by SKU (or, for a
+  missing-PO suggestion only, by product identity and specifications).
 - An invoice with no printed PO goes to `HOLD` with candidate POs. It is never auto-allocated.
-- If no ISO code is printed, a `$` sign is read as USD. The note is kept on the currency field.
+- If no ISO code is printed, a `$` sign is read as USD. The note is kept on the currency field. With no marker at
+  all, only a workspace `default_currency` supplies one.
 - A held or blocked run contributes zero to PO balances.
 - Each CSV import creates a new workspace. This isolates test scenarios. Browser uploads go to the workspace shown
   on the upload page; API uploads without `workspace_id` go to the latest workspace.

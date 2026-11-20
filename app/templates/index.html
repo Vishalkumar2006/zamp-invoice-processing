@@ -12,6 +12,12 @@
       <label>vendors.csv <input type="file" name="vendors" accept=".csv" required></label>
       <label>purchase_orders.csv <input type="file" name="purchase_orders" accept=".csv" required></label>
       <label>po_lines.csv <input type="file" name="po_lines" accept=".csv" required></label>
+      <label>Numeric date order (optional)
+        <select name="date_order"><option value="">not set: hold ambiguous dates</option>
+          <option value="MDY">MDY (03/04/2026 = 4 Mar)</option><option value="DMY">DMY (03/04/2026 = 3 Apr)</option></select></label>
+      <label>Default currency (optional)
+        <select name="default_currency"><option value="">not set: hold when none printed</option>
+          <option value="USD">USD</option></select></label>
       <button type="submit">Import into a new workspace</button>
     </form>
     <div id="import-result" class="result"></div>

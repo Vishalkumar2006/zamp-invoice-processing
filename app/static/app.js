@@ -25,7 +25,9 @@ function initHome() {
     out.textContent = "Importing…";
     const { res, body } = await postForm("/procurement/import", imp);
     if (res.ok) {
-      out.textContent = `Imported into ${body.workspace_id}: ${body.vendors} vendors, ${body.purchase_orders} POs, ${body.po_lines} lines.`;
+      const st = Object.entries(body.settings || {}).map(([k, v]) => `${k} ${v}`).join(", ");
+      out.textContent = `Imported into ${body.workspace_id}: ${body.vendors} vendors, ${body.purchase_orders} POs, ${body.po_lines} lines`
+        + (st ? ` (settings: ${st}).` : ".");
       setTimeout(() => location.reload(), 700);
     } else {
       out.className = "result err";
@@ -66,6 +68,7 @@ async function loadRecent() {
 }
 
 function evidenceCell(f) {
+  if (f && !f.evidence && f.source === "workspace_config") return '<span class="src">workspace configuration (not printed on the invoice)</span>';
   if (!f || !f.evidence) return '<span class="muted">not found</span>';
   const ev = f.evidence;
   const label = ev.label ? ` · next to “${esc(ev.label)}”` : "";
@@ -183,24 +186,37 @@ function renderCandidates(d) {
   const ok = (v) => (v ? "✓" : "✗");
   const cell = (c, html, good) => `<td class="${good === false ? "bad" : ""}">${html}</td>`;
   const row = (label, fn) => `<tr><th>${label}</th>${cs.map(fn).join("")}</tr>`;
+  // Older stored decisions have only sku_ok; newer ones add `mapped` and, for vendor part numbers, product evidence.
+  const mapped = (l) => (l.mapped !== undefined ? l.mapped : l.sku_ok);
+  const productCell = (l) => {
+    const comps = (l.product_comparison || []).map((x) => `<div class="${x.qualifies ? "" : "muted"}">
+      ${x.qualifies ? ok(true) : ok(false)} ${esc(x.po_sku)} “${esc(x.po_description)}”:
+      ${x.qualifies ? `product ${esc(x.shared_words.join(", "))} · specs ${esc(x.shared_specs.join(", "))}` : esc(x.problems.join("; "))}</div>`).join("");
+    const head = mapped(l)
+      ? `${ok(true)} as PO line ${esc(l.po_line_id)} ${esc(l.po_sku)} (inferred from product and specifications)`
+      : `${ok(false)} no unique PO line by product and specifications`;
+    return `${head}<br><span class="muted">${l.source ? esc(l.source) : ""}</span>${comps}`;
+  };
   const lineRows = pc.invoice_lines.map((il, idx) => {
     const L = (c) => c.lines[idx] || {};
     return [
-      row(`Line ${il.line}: SKU ${esc(il.sku)}`, (c) => cell(c, L(c).sku_ok
+      row(`Line ${il.line}: ${il.description !== undefined ? "printed part" : "SKU"} ${esc(il.sku)}${il.description ? `<br><span class="muted">${esc(il.description)}</span>` : ""}`,
+        (c) => cell(c, L(c).match_method === "product_specs" ? productCell(L(c)) : (L(c).sku_ok
         ? `${ok(true)} PO line ${esc(L(c).po_line_id)}<br><span class="muted">${esc(L(c).source)}</span>`
-        : (L(c).repeated_mapping_of ? `${ok(false)} PO line ${esc(L(c).po_line_id)} already used by invoice line ${esc(L(c).repeated_mapping_of)}` : `${ok(false)} not on PO`), L(c).sku_ok)),
-      row(`Unit price ${esc(il.unit_price)}`, (c) => cell(c, L(c).sku_ok
+        : (L(c).repeated_mapping_of ? `${ok(false)} PO line ${esc(L(c).po_line_id)} already used by invoice line ${esc(L(c).repeated_mapping_of)}` : `${ok(false)} not on PO`)), mapped(L(c)))),
+      row(`Unit price ${esc(il.unit_price)}`, (c) => cell(c, mapped(L(c))
         ? `${ok(L(c).price_ok)} PO ${esc(L(c).po_unit_price)} (${esc(L(c).variance_pct)}%)` : "—", L(c).price_ok)),
-      row(`Quantity ${esc(il.quantity)}`, (c) => cell(c, L(c).sku_ok
+      row(`Quantity ${esc(il.quantity)}`, (c) => cell(c, mapped(L(c))
         ? `${ok(L(c).quantity_ok)} ${esc(L(c).remaining_quantity)} left of ${esc(L(c).authorized_quantity)}` : "—",
         L(c).quantity_ok)),
-      row(`Amount ${money(il.amount_cents, cur)}`, (c) => cell(c, L(c).sku_ok
+      row(`Amount ${money(il.amount_cents, cur)}`, (c) => cell(c, mapped(L(c))
         ? `${ok(L(c).amount_ok)} ${money(L(c).remaining_net_cents, cur)} left on line` : "—", L(c).amount_ok)),
     ].join("");
   }).join("");
   const viable = new Set(pc.viable_po_ids);
+  const equal = new Set(pc.equal_total_ineligible_po_ids || []);
   const head = cs.map((c) => `<th class="${viable.has(c.po_id) ? "fit" : ""}">${esc(c.po_id)}<br>
-    <span class="muted">${viable.has(c.po_id) ? "fits" : "does not fit"}</span></th>`).join("");
+    <span class="muted">${viable.has(c.po_id) ? "fits (suggestion only)" : equal.has(c.po_id) ? "ineligible despite equal total" : "does not fit"}</span></th>`).join("");
   return `<h3 class="sub">PO candidates (no PO printed on the invoice)</h3>
     <p class="muted">Compared at decision time on: ${esc(pc.criteria)}.
       ${pc.delivery_reference ? `Delivery reference on the invoice: <strong>${esc(pc.delivery_reference)}</strong>.` : "No delivery reference could be read reliably."}
@@ -313,10 +329,13 @@ function renderEvidence(x) {
   const cur = inv.currency.value;
   const fields = [["Supplier", "supplier_name"], ["Invoice number", "invoice_number"], ["Invoice date", "invoice_date"],
     ["PO reference", "po_reference"], ["Service period", "service_period"], ["Delivery reference", "delivery_reference"],
-    ["Currency", "currency"], ["Net / subtotal", "net"], ["Tax", "tax"], ["Total", "gross"]];
+    ["Currency", "currency"], ["Net / subtotal", "net"], ["Tax", "tax"], ["Freight", "freight"], ["Total", "gross"]];
   const val = (k, f) => {
     if (f.value === null || f.value === undefined) return `<span class="muted">${esc(f.note || "—")}</span>`;
-    return ["net", "tax", "gross"].includes(k) ? money(f.value, cur) : esc(f.value);
+    const shown = ["net", "tax", "gross", "freight"].includes(k) ? money(f.value, cur) : esc(f.value);
+    // Values resolved from the workspace configuration (default currency, numeric date order) say so.
+    return f.source === "workspace_config" || (f.note && k === "invoice_date")
+      ? `${shown}<br><span class="muted">${esc(f.note || "from the workspace configuration")}</span>` : shown;
   };
   const pages = x.pages.map((p) => {
     const conf = p.mean_conf !== null ? ` (mean conf ${p.mean_conf}, skew ${p.skew_slope})` : "";
@@ -324,8 +343,8 @@ function renderEvidence(x) {
   }).join("; ");
   const frows = fields.map(([label, k]) => `<tr><td>${label}</td><td>${val(k, inv[k] || {})}</td><td>${evidenceCell(inv[k])}</td></tr>`).join("");
   const lrows = inv.lines.map((l) => `<tr><td>${esc(l.sku.value)}</td><td>${esc(l.description.value)}</td>
-    <td class="num">${esc(l.quantity.value)}</td><td class="num">${esc(l.unit_price.value)}</td><td class="num">${money(l.amount.value, cur)}</td></tr>
-    <tr><td colspan="5">qty ${evidenceCell(l.quantity)}<br>amount ${evidenceCell(l.amount)}</td></tr>`).join("");
+    <td class="num">${esc(l.quantity.value)}</td><td class="num">${esc(l.unit_price.raw || l.unit_price.value)}</td><td class="num">${money(l.amount.value, cur)}</td></tr>
+    <tr><td colspan="5">qty ${evidenceCell(l.quantity)}<br>rate ${evidenceCell(l.unit_price)}${l.unit_price.note ? ` (${esc(l.unit_price.note)})` : ""}<br>amount ${evidenceCell(l.amount)}</td></tr>`).join("");
   document.getElementById("evidence").innerHTML = `
     <p class="muted">${esc(pages)} · extraction ${x.duration_ms} ms · model calls ${x.model_calls}</p>
     <table><thead><tr><th>Field</th><th>Value</th><th>Source</th></tr></thead><tbody>${frows}</tbody></table>

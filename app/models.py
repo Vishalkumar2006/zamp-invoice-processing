@@ -58,6 +58,9 @@ class Field_(BaseModel):
     value: Any = None
     evidence: Optional[Evidence] = None
     note: Optional[str] = None
+    # Where a value not read from the document came from: "workspace_config" (a configured default currency, or
+    # a numeric date read in the configured date order). None = read from the document as printed.
+    source: Optional[str] = None
 
 
 class LineItem(BaseModel):
@@ -93,6 +96,8 @@ class ExtractedInvoice(BaseModel):
     net: Field_ = Field(default_factory=Field_)  # cents
     tax: Field_ = Field(default_factory=Field_)  # cents
     gross: Field_ = Field(default_factory=Field_)  # cents
+    # Freight / shipping charge printed in the totals block (cents). Zero passes; nonzero or unclear is held.
+    freight: Field_ = Field(default_factory=Field_)
     lines: list[LineItem] = Field(default_factory=list)
     issues: list[str] = Field(default_factory=list)
 
@@ -102,6 +107,8 @@ class ExtractionResult(BaseModel):
     pages: list[PageInfo]
     duration_ms: int
     model_calls: int = 0
+    # Workspace settings applied during extraction ({"date_order": "MDY", "default_currency": "USD"}), if any.
+    settings: Optional[dict[str, Any]] = None
 
 
 class Decision(BaseModel):

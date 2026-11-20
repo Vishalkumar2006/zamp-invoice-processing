@@ -9,7 +9,7 @@ import traceback
 from pathlib import Path
 
 from . import config
-from .db import add_event, db, now_iso, transaction
+from .db import add_event, db, now_iso, transaction, workspace_settings
 from .extraction import ExtractionError, extract
 from .ledger import finalize
 
@@ -53,7 +53,8 @@ def process(run_id: str) -> None:
         try:
             if not run["extraction_json"]:
                 add_event(conn, run_id, "extract", "started", "Reading pages (native text or OCR)")
-                result = extract(Path(run["pdf_path"]))
+                settings = workspace_settings(conn, run["workspace_id"])  # optional date order / default currency
+                result = extract(Path(run["pdf_path"]), settings)
                 inv = result.invoice
                 with transaction(conn):
                     conn.execute("UPDATE runs SET extraction_json=? WHERE id=?", (result.model_dump_json(), run_id))

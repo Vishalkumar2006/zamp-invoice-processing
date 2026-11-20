@@ -135,6 +135,8 @@ def _evidence(inv: ExtractedInvoice, min_conf: float, check) -> None:
         critical.append(("tax", inv.tax))
     if inv.po_reference.raw is not None:
         critical.append(("po_reference", inv.po_reference))
+    if inv.freight.value is not None or inv.freight.raw is not None:
+        critical.append(("freight", inv.freight))
     for i, line in enumerate(inv.lines, start=1):
         # No SKU printed at all: the verified description identifies the charge instead (mapped later,
         # only on a printed PO). A printed but unreadable SKU still holds here.
@@ -142,6 +144,8 @@ def _evidence(inv: ExtractedInvoice, min_conf: float, check) -> None:
         for name in (ident, "quantity", "unit_price", "amount"):
             critical.append((f"line {i} {name}", getattr(line, name)))
     for name, f in critical:
+        if name == "currency" and f.value is not None and f.source == "workspace_config":
+            continue  # no marker printed: the workspace's configured default currency, recorded with its source
         if f.value is None or f.evidence is None:
             why = f.note or "not found on the document"
             check("evidence", False, f"{name}: {why}", field=name, raw=f.raw)
@@ -169,8 +173,10 @@ def _evidence(inv: ExtractedInvoice, min_conf: float, check) -> None:
         check("evidence", False, f"unsupported currency {inv.currency.value}", currency=inv.currency.value)
         raise _Stop("HOLD", "UNSUPPORTED_CURRENCY", f"Currency {inv.currency.value} is not supported.",
                     "Route to manual processing.", review_field="currency")
-    check("evidence", True, f"{len(critical)} critical values found with confidence >= {min_conf}",
-          min_conf_observed=min(f.evidence.conf for _, f in critical))
+    configured = [n for n, f in critical if f.source == "workspace_config"]
+    check("evidence", True, f"{len(critical)} critical values found with confidence >= {min_conf}"
+          + (f" ({', '.join(configured)} from the workspace configuration)" if configured else ""),
+          min_conf_observed=min(f.evidence.conf for _, f in critical if f.evidence is not None))
 
 
 LEGAL_SUFFIXES = ("incorporated", "inc", "l l c", "llc", "limited", "ltd", "company", "co", "corporation", "corp",
@@ -706,16 +712,136 @@ def _number_variant(inv, snap: Snapshot, vendor, accepted, key, check, ctx, dup,
                     review_field="invoice_number")
 
 
+# Product matching for a missing PO when the vendor prints its own part numbers. Generic trade abbreviations
+# (not mappings of particular items) so "GR5" reads as grade 5 and "SS" as stainless.
+_PRODUCT_ABBREV = {"gr": "grade", "grd": "grade", "ss": "stainless", "sst": "stainless", "stl": "steel",
+                   "galv": "galvanized", "zn": "zinc", "alum": "aluminum", "yel": "yellow", "blk": "black",
+                   "wht": "white", "hx": "hex", "wshr": "washer", "scr": "screw"}
+_PRODUCT_UNITS = {"in", "inch", "inches", "mm", "cm", "ft", "x", "ea", "pc", "pcs", "box", "pack", "pk", "lb", "lbs",
+                  "qty", "of", "per"}
+
+
+def _singular(w: str) -> str:
+    if re.search(r"(ss|x|ch|sh)es$", w) and len(w) > 4:
+        return w[:-2]
+    if w.endswith("s") and not w.endswith("ss") and len(w) > 3:
+        return w[:-1]
+    return w
+
+
+def product_terms(text: Optional[str]) -> tuple[set[str], set[str]]:
+    """(identity words, specification tokens) of a goods description. Identity words say what the product is
+    (bolt, hex, washer, grade, stainless); specifications are the printed sizes, grades and thread or model codes
+    ("3/8-16", "2", "5", "m8"), with units dropped ("3 in" -> "3")."""
+    words: set[str] = set()
+    specs: set[str] = set()
+    s = (text or "").lower().replace('"', " in ").replace("”", " in ")
+    for raw in re.split(r"[\s,;()]+", s):
+        tok = raw.strip(".:#'*")
+        for part in re.split(r"(?<=\d)x(?=\d)", tok):           # "24x36" -> 24, 36
+            if not part:
+                continue
+            m = re.fullmatch(r"([a-z]+)(\d+(?:\.\d+)?)", part)
+            if m and m.group(1) in _PRODUCT_ABBREV:              # "gr5" -> grade + 5
+                words.add(_PRODUCT_ABBREV[m.group(1)])
+                specs.add(m.group(2))
+                continue
+            m = re.fullmatch(r"(\d[\d./-]*?)[-/.]?(in|mm|cm|ft)?", part)
+            if m:                                                # "2", "3/8-16", "2in"
+                specs.add(m.group(1))
+                continue
+            if re.search(r"\d", part):                           # "m8", "z87.1"
+                specs.add(part)
+                continue
+            w = _singular(_PRODUCT_ABBREV.get(part, part))
+            if len(w) >= 3 and w not in _PRODUCT_UNITS and w not in _DESC_STOP and w not in _GENERIC_WORDS:
+                words.add(w)
+    return words, specs
+
+
+def match_product(description: Optional[str], po_lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Compare an invoice line's description with each PO line by product identity and specifications.
+
+    A PO line qualifies only if it names at least 2 identity words and at least 1 specification, the invoice
+    description contains every one of them, and no invoice qualifier contradicts it (negated or prefixed forms,
+    negation words, exclusive groups). Extra detail on the invoice (finish, standard) is allowed; a missing or
+    different size, grade or material is not. Quantity, price and remaining authorization are checked separately."""
+    inv_words, inv_specs = product_terms(description)
+    out = []
+    for pl in po_lines:
+        words, specs = product_terms(pl.get("description"))
+        missing_w, missing_s = sorted(words - inv_words), sorted(specs - inv_specs)
+        conflicts = _description_conflicts(description, inv_words, words)
+        problems = ([f"only {len(words)} identifying word(s) on the PO line"] if len(words) < 2 else []) + (
+            ["no specification on the PO line to confirm the product"] if not specs else []) + (
+            [f"the invoice does not name {', '.join(missing_w)}"] if missing_w else []) + (
+            [f"PO specification {', '.join(missing_s)} not on the invoice (invoice prints {', '.join(sorted(inv_specs)) or 'none'})"]
+            if missing_s else []) + ([f"conflicting: {'; '.join(conflicts)}"] if conflicts else [])
+        out.append({"po_line_id": pl["line_id"], "po_sku": pl["sku"], "po_description": pl.get("description"),
+                    "po_words": sorted(words), "po_specs": sorted(specs), "shared_words": sorted(words & inv_words),
+                    "shared_specs": sorted(specs & inv_specs), "missing_words": missing_w, "missing_specs": missing_s,
+                    "conflicts": conflicts, "qualifies": not problems, "problems": problems,
+                    "source": f"{pl['source_file']} row {pl['source_row']}" if "source_file" in pl else None})
+    return out
+
+
+def _one_to_one(options: list[list[str]], limit: int = 2) -> list[list[str]]:
+    """Up to `limit` assignments giving every invoice line its own PO line (options[i] = qualifying line ids)."""
+    found: list[list[str]] = []
+
+    def walk(i: int, used: set[str], cur: list[str]) -> None:
+        if len(found) >= limit:
+            return
+        if i == len(options):
+            found.append(cur[:])
+            return
+        for pid in options[i]:
+            if pid not in used:
+                walk(i + 1, used | {pid}, cur + [pid])
+
+    walk(0, set(), [])
+    return found
+
+
 def _candidate_evidence(inv: ExtractedInvoice, snap: Snapshot, po: dict[str, Any], vendor) -> dict[str, Any]:
-    """Compare one vendor PO with the verified invoice lines. Pure; used only to explain a hold."""
+    """Compare one vendor PO with the verified invoice lines. Pure; used only to explain a hold.
+
+    Lines whose printed SKU is on the PO map by SKU. A printed part number that is not on the PO (the vendor's
+    own numbering) maps by product identity and specifications instead; across those lines the mapping must be
+    one-to-one and unique, otherwise the line evidence is reported as missing or ambiguous."""
     bal = po_balance(snap, po["po_id"])
-    by_sku = {pl["sku"]: pl for pl in snap.po_lines.get(po["po_id"], [])}
+    po_lines = snap.po_lines.get(po["po_id"], [])
+    by_sku = {pl["sku"]: pl for pl in po_lines}
+    by_id = {pl["line_id"]: pl for pl in po_lines}
     bal_lines = {b["line_id"]: b for b in bal["lines"]}
     failures: list[str] = []
     if po["status"] != "OPEN":
         failures.append(f"status is {po['status']}")
     if po["currency"] != inv.currency.value:
         failures.append(f"currency {po['currency']} vs invoice {inv.currency.value}")
+    sku_claimed = {by_sku[l.sku.value]["line_id"] for l in inv.lines if l.sku.value in by_sku}
+    by_product: dict[int, dict[str, Any]] = {}   # invoice line -> product comparison and assigned PO line
+    product_idx = [i for i, l in enumerate(inv.lines, start=1) if l.sku.value and l.sku.value not in by_sku]
+    if product_idx:
+        free = [pl for pl in po_lines if pl["line_id"] not in sku_claimed]
+        comps = {i: match_product(inv.lines[i - 1].description.value, free) for i in product_idx}
+        options = [[c["po_line_id"] for c in comps[i] if c["qualifies"]] for i in product_idx]
+        assignments = _one_to_one(options)
+        for k, i in enumerate(product_idx):
+            by_product[i] = {"comparison": comps[i], "options": options[k],
+                             "assigned": assignments[0][k] if len(assignments) == 1 else None}
+        line_txt = lambda i: f"invoice line {i} ({inv.lines[i - 1].sku.value} \"{inv.lines[i - 1].description.value}\")"
+        for k, i in enumerate(product_idx):
+            if not options[k]:
+                why = "; ".join(f"{c['po_sku']} \"{c['po_description']}\": {', '.join(c['problems'])}" for c in comps[i])
+                failures.append(f"{line_txt(i)} matches no line by product and specification ({why or 'no free PO line'})")
+        if all(options) and not assignments:
+            failures.append("the invoice lines cannot each be given their own PO line: "
+                            + "; ".join(f"{line_txt(i)} fits only {', '.join(options[k])}" for k, i in enumerate(product_idx)))
+        if len(assignments) > 1:
+            failures.append("ambiguous line evidence: " + "; ".join(
+                f"{line_txt(i)} fits PO lines {', '.join(by_id[p]['sku'] for p in options[k])}"
+                for k, i in enumerate(product_idx) if len(options[k]) > 1))
     lines = []
     mapped_by: dict[str, int] = {}  # PO line id -> invoice line already mapped to it
     for i, line in enumerate(inv.lines, start=1):
@@ -723,18 +849,31 @@ def _candidate_evidence(inv: ExtractedInvoice, snap: Snapshot, po: dict[str, Any
         pl = by_sku.get(sku)
         row: dict[str, Any] = {"invoice_line": i, "sku": sku, "invoice_quantity": line.quantity.value,
                                "invoice_unit_price": line.unit_price.value, "invoice_amount_cents": line.amount.value,
-                               "po_line_id": None, "source": None}
+                               "po_line_id": None, "source": None, "match_method": "sku"}
+        prod = by_product.get(i)
+        if prod is not None:
+            # The printed part number stays as printed; the inferred PO line is recorded separately.
+            row.update(match_method="product_specs", invoice_description=line.description.value,
+                       product_comparison=prod["comparison"], product_options=prod["options"])
+            if prod["assigned"]:
+                pl = by_id[prod["assigned"]]
+                hit = next(c for c in prod["comparison"] if c["po_line_id"] == pl["line_id"])
+                row.update(po_sku=pl["sku"], po_description=pl.get("description"), shared_words=hit["shared_words"],
+                           shared_specs=hit["shared_specs"])
         if pl is None:
-            row.update(sku_ok=False, price_ok=False, quantity_ok=False, amount_ok=False)
-            failures.append(f"no {sku} line" if sku else
-                            f"invoice line {i} has no SKU (a description-only line is matched only on a printed PO)")
+            row.update(sku_ok=False, mapped=False, price_ok=False, quantity_ok=False, amount_ok=False)
+            if prod is None:
+                failures.append(f"no {sku} line" if sku else
+                                f"invoice line {i} has no SKU (a description-only line is matched only on a printed PO)")
             lines.append(row)
             continue
+        if prod is not None:
+            sku = f"{sku} (as {pl['sku']})"
         if pl["line_id"] in mapped_by:
             # Each invoice line must map to its own PO line (the rule used for an explicit PO).
             first = mapped_by[pl["line_id"]]
             row.update(po_line_id=pl["line_id"], source=f"{pl['source_file']} row {pl['source_row']}", sku_ok=False,
-                       price_ok=False, quantity_ok=False, amount_ok=False, repeated_mapping_of=first)
+                       mapped=False, price_ok=False, quantity_ok=False, amount_ok=False, repeated_mapping_of=first)
             failures.append(f"invoice lines {first} and {i} both map to {sku} PO line {pl['line_id']} "
                             f"(each invoice line needs its own PO line)")
             lines.append(row)
@@ -747,8 +886,8 @@ def _candidate_evidence(inv: ExtractedInvoice, snap: Snapshot, po: dict[str, Any
         qty = Decimal(line.quantity.value)
         qty_ok = qty <= Decimal(b["remaining_quantity"])
         amount_ok = line.amount.value <= b["remaining_net_cents"]
-        row.update(po_line_id=pl["line_id"], source=f"{pl['source_file']} row {pl['source_row']}", sku_ok=True,
-                   po_unit_price=pl["unit_price"],
+        row.update(po_line_id=pl["line_id"], source=f"{pl['source_file']} row {pl['source_row']}",
+                   sku_ok=row["match_method"] == "sku", mapped=True, po_unit_price=pl["unit_price"],
                    variance_pct=f"{_pct_figure(variance, po_rate):f}", price_ok=price_ok,
                    authorized_quantity=b["authorized_quantity"], allocated_quantity=b["allocated_quantity"],
                    remaining_quantity=b["remaining_quantity"], quantity_ok=qty_ok,
@@ -790,12 +929,17 @@ def _missing_po(inv, snap: Snapshot, vendor, check, ctx) -> None:
     ctx["po_candidates"] = {
         "delivery_reference": delivery,
         "delivery_reference_evidence": dn.evidence.model_dump() if dn.evidence is not None else None,
-        "invoice_lines": [{"line": i, "sku": l.sku.value, "quantity": l.quantity.value, "unit_price": l.unit_price.value,
+        "invoice_lines": [{"line": i, "sku": l.sku.value, "description": l.description.value,
+                           "quantity": l.quantity.value, "unit_price": l.unit_price.value,
                            "amount_cents": l.amount.value} for i, l in enumerate(inv.lines, start=1)],
         "invoice_net_cents": inv.net.value, "currency": inv.currency.value,
-        "criteria": "approved vendor, OPEN status, same currency, every invoice SKU on the PO, unit price within 1%, "
-                    "quantity and net within remaining authorization",
+        "criteria": "approved vendor, OPEN status, same currency, every invoice line on its own PO line (by SKU, or "
+                    "by product identity and specifications when the printed part number is not on the PO, one-to-one "
+                    "and unique), unit price within 1%, quantity and net within remaining authorization; an equal "
+                    "total alone never qualifies",
         "candidates": cands, "viable_po_ids": viable,
+        "equal_total_ineligible_po_ids": [c["po_id"] for c in cands
+                                          if not c["viable"] and c["authorized_net_cents"] == inv.net.value],
     }
     for c in cands:
         check("po_candidate", c["viable"], f"{c['po_id']}: " + ("fits every criterion" if c["viable"]
@@ -812,11 +956,38 @@ def _missing_po(inv, snap: Snapshot, vendor, check, ctx) -> None:
                     f"Re-submit with the confirmed PO; nothing is allocated until then.",
                     review_field="po_reference")
     if len(viable) == 1:
+        fit = next(c for c in cands if c["po_id"] == viable[0])
+        by_product = [r for r in fit["lines"] if r.get("match_method") == "product_specs"]
+        if not by_product:
+            raise _Stop("HOLD", "PO_MISSING",
+                        f"No PO is printed on the invoice. One open PO fits ({viable[0]}), but a missing PO is never "
+                        f"assigned automatically.",
+                        f"Ask procurement to confirm that {viable[0]} covers {dn_text}, then re-submit "
+                        f"with the PO.", review_field="po_reference")
+        cur = inv.currency.value
+        support = "; ".join(
+            f"line {r['invoice_line']} {r['sku']} \"{r['invoice_description']}\" -> {viable[0]} line {r['po_line_id']} "
+            f"{r['po_sku']} \"{r['po_description']}\" (product: {', '.join(r['shared_words'])}; specifications: "
+            f"{', '.join(r['shared_specs'])}; {r['invoice_quantity']} at {r['invoice_unit_price']} vs PO "
+            f"{r['po_unit_price']}, within the remaining {r['remaining_quantity']} units / "
+            f"{fmt_cents(r['remaining_net_cents'], cur)})" for r in by_product)
+        ruled_out = []
+        for c in cands:
+            if c["po_id"] in viable or c["authorized_net_cents"] != inv.net.value:
+                continue
+            why = "; ".join(f"line {r['invoice_line']} {r['sku']}: " + " | ".join(
+                f"{x['po_sku']} \"{x['po_description']}\" {', '.join(x['problems'])}" for x in r["product_comparison"])
+                            for r in c["lines"] if r.get("match_method") == "product_specs" and not r.get("mapped"))
+            ruled_out.append(f"{c['po_id']} has the same total ({fmt_cents(c['authorized_net_cents'], cur)}) but is not "
+                             f"eligible: " + (why or "; ".join(c["failures"])))
         raise _Stop("HOLD", "PO_MISSING",
-                    f"No PO is printed on the invoice. One open PO fits ({viable[0]}), but a missing PO is never "
-                    f"assigned automatically.",
-                    f"Ask procurement to confirm that {viable[0]} covers {dn_text}, then re-submit "
-                    f"with the PO.", review_field="po_reference")
+                    f"No PO is printed on the invoice, so it is held pending PO confirmation. The vendor's part numbers "
+                    f"are not PO SKUs; by line evidence one open PO fits, {viable[0]}: {support}. "
+                    + (". ".join(ruled_out) + ". " if ruled_out else "")
+                    + "A missing PO is never assigned automatically; nothing is allocated.",
+                    f"Ask procurement to confirm that {viable[0]} covers {dn_text} (suggested from line evidence: "
+                    f"{', '.join(r['sku'] + ' as ' + r['po_sku'] for r in by_product)}), then re-submit with the PO.",
+                    review_field="po_reference")
     why = "; ".join(f"{c['po_id']}: {', '.join(c['failures'])}" for c in cands) or "the vendor has no POs"
     raise _Stop("HOLD", "PO_MISSING_NO_MATCH",
                 f"No PO is printed on the invoice and no PO for {vendor['legal_name']} fits it ({why}).",
@@ -827,6 +998,8 @@ def _missing_po(inv, snap: Snapshot, vendor, check, ctx) -> None:
 def _po(inv, snap: Snapshot, vendor, check, ctx) -> dict[str, Any]:
     ref = inv.po_reference.value
     if ref is None:
+        # A PO is only suggested for verified figures: lines, subtotal, tax, freight and total must reconcile first.
+        _arithmetic(inv, check)
         _missing_po(inv, snap, vendor, check, ctx)
     po = snap.pos.get(ref)
     if po is None:
@@ -868,6 +1041,14 @@ def _arithmetic(inv: ExtractedInvoice, check) -> None:
                     f"Line amounts sum to {fmt_cents(lines_total)} but the subtotal is {fmt_cents(inv.net.value)}.",
                     "Ask the vendor to correct the invoice totals.", review_field="net")
     tax = inv.tax.value or 0
+    freight = inv.freight.value
+    if freight is not None and not check("arithmetic", freight == 0,
+                                         f"freight printed as {fmt_cents(freight)}", freight_cents=freight):
+        raise _Stop("HOLD", "TOTALS_MISMATCH",
+                    f"The invoice adds freight of {fmt_cents(freight)} to the total. Only PO lines are authorized, "
+                    f"so a charge outside them is never accepted automatically.",
+                    "Confirm with procurement whether the freight is payable and against which PO line.",
+                    review_field="freight")
     if not check("arithmetic", inv.net.value + tax == inv.gross.value,
                  f"net {fmt_cents(inv.net.value)} + tax {fmt_cents(tax)} vs total {fmt_cents(inv.gross.value)}",
                  net_cents=inv.net.value, tax_cents=tax, gross_cents=inv.gross.value):

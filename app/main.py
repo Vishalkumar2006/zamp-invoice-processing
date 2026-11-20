@@ -19,11 +19,11 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from . import config
-from .db import add_event, db, init_db, latest_workspace_id, now_iso, transaction
+from .db import add_event, db, init_db, latest_workspace_id, now_iso, transaction, workspace_settings
 from .extraction import tool_versions
 from .ledger import finalize, ledger_report, load_snapshot
 from .money import fmt_cents
-from .procurement import ImportError_, import_procurement
+from .procurement import ImportError_, import_procurement, validate_settings
 from .remittance import extraction_identifiers, redact_extraction, redact_identifiers, redact_vendor
 from .rules import po_balance
 from .worker import Worker, recover_interrupted
@@ -176,7 +176,10 @@ def health() -> dict[str, Any]:
 
 @app.post("/procurement/import", status_code=201)
 async def procurement_import(vendors: UploadFile = File(...), purchase_orders: UploadFile = File(...),
-                             po_lines: UploadFile = File(...)):
+                             po_lines: UploadFile = File(...), date_order: Optional[str] = Form(None),
+                             default_currency: Optional[str] = Form(None)):
+    """Optional workspace settings: date_order (MDY or DMY) resolves numeric dates such as 03/04/2026;
+    default_currency applies only when an invoice prints no currency code or symbol. Unset = hold as before."""
     files = {
         "vendors": (vendors.filename or "vendors.csv", await vendors.read()),
         "purchase_orders": (purchase_orders.filename or "purchase_orders.csv", await purchase_orders.read()),
@@ -184,7 +187,7 @@ async def procurement_import(vendors: UploadFile = File(...), purchase_orders: U
     }
     with db() as conn:
         try:
-            return import_procurement(conn, files)
+            return import_procurement(conn, files, validate_settings(date_order, default_currency))
         except ImportError_ as exc:
             return JSONResponse(status_code=422, content={"detail": "import rejected", "errors": exc.errors})
 
@@ -196,7 +199,8 @@ def procurement(workspace_id: Optional[str] = None) -> dict[str, Any]:
         if not ws:
             raise HTTPException(404, "no procurement data imported")
         snap = load_snapshot(conn, ws)
-        return {"workspace_id": ws, "vendors": [redact_vendor(v) for v in snap.vendors],
+        return {"workspace_id": ws, "settings": workspace_settings(conn, ws),
+                "vendors": [redact_vendor(v) for v in snap.vendors],
                 "purchase_orders": list(snap.pos.values()),
                 "po_lines": [l for ls in snap.po_lines.values() for l in ls]}
 

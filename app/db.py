@@ -13,7 +13,9 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS workspaces (
     id TEXT PRIMARY KEY,
     created_at TEXT NOT NULL,
-    source_files_json TEXT NOT NULL
+    source_files_json TEXT NOT NULL,
+    date_order TEXT,
+    default_currency TEXT
 );
 
 CREATE TABLE IF NOT EXISTS vendors (
@@ -142,6 +144,15 @@ def connect() -> sqlite3.Connection:
 
 
 VENDOR_REMITTANCE_COLUMNS = ("bank_name", "routing_number", "account_number", "verification_phone")
+WORKSPACE_SETTING_COLUMNS = ("date_order", "default_currency")
+
+
+def workspace_settings(conn: sqlite3.Connection, workspace_id: str) -> dict[str, str]:
+    """Configured settings of a workspace ({} when none, or for a database from before the columns existed)."""
+    row = conn.execute("SELECT * FROM workspaces WHERE id=?", (workspace_id,)).fetchone()
+    if row is None:
+        return {}
+    return {k: row[k] for k in WORKSPACE_SETTING_COLUMNS if k in row.keys() and row[k]}
 
 
 def init_db() -> None:
@@ -155,6 +166,11 @@ def init_db() -> None:
         for col in VENDOR_REMITTANCE_COLUMNS:
             if col not in have:
                 conn.execute(f"ALTER TABLE vendors ADD COLUMN {col} TEXT")
+        # Optional workspace settings (numeric date order, default currency); NULL keeps the original behaviour.
+        have = {r[1] for r in conn.execute("PRAGMA table_info(workspaces)")}
+        for col in WORKSPACE_SETTING_COLUMNS:
+            if col not in have:
+                conn.execute(f"ALTER TABLE workspaces ADD COLUMN {col} TEXT")
     finally:
         conn.close()
 

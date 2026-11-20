@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 import statistics
 from dataclasses import dataclass, field
+from functools import cached_property
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Callable, Iterable, Optional
@@ -136,13 +137,17 @@ LABELS: dict[str, re.Pattern[str]] = {
     "po_reference": re.compile(
         r"^((customer|client|buyer|your) )?"
         r"(purchase order( (number|no\.?|#|ref(erence)?))?|p\.?o\.?( (number|no\.?|#|ref(erence)?))?)$"),
-    "net": re.compile(r"^(sub ?total|net( total| amount)?|total before tax|subtotal \(excl\.? tax\)|merchandise( total)?)"
-                      + _CUR + "$"),
+    "net": re.compile(r"^(sub ?total|net( total| amount)?|total before tax|subtotal \(excl\.? tax\)|merchandise( total)?"
+                      r"|merch( total)?)" + _CUR + "$"),
     "tax": re.compile(r"^((sales )?tax|vat|gst)( \(?[\d.]+ ?%\)?)?" + _CUR + "$"),
-    "gross": re.compile(r"^((grand |invoice )?total( due| amount)?|(amount|balance) due)" + _CUR + "$"),
+    "gross": re.compile(r"^((grand |invoice )?total( due| amount)?|(amount|amt|balance) due|pay this (amount|amt))"
+                        + _CUR + "$"),
+    # Freight / shipping charges printed in the totals block. Read so a nonzero or unclear charge is never ignored.
+    "freight": re.compile(r"^(freight|shipping|shipping (and|&) handling|s ?& ?h|handling)" + _CUR + "$"),
     "service_period": re.compile(r"^(service period|billing period|period of service|service dates?)$"),
 }
-TOTAL_KEYS = ("net", "tax", "gross")
+TOTAL_KEYS = ("net", "tax", "gross", "freight")
+TABLE_END_KEYS = ("net", "tax", "gross")  # a freight/shipping line item does not end the line table
 # Spaces in label patterns are optional so OCR word splits/joins ("S ubtotal", "Invoicenumber")
 # still match when the label text is compared with its spaces removed.
 LABELS = {k: re.compile(p.pattern.replace(" ", " ?")) for k, p in LABELS.items()}
@@ -183,14 +188,27 @@ def _match_label(seg: Segment, include_other: bool = False) -> Optional[tuple[st
 _DATE_FORMATS = ("%B %d, %Y", "%b %d, %Y", "%b. %d, %Y", "%d %B %Y", "%d %b %Y", "%Y-%m-%d", "%B %d %Y")
 
 
-def parse_date(text: str) -> tuple[Optional[str], Optional[str]]:
+_NUMERIC_DATE = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{4})$")
+
+
+def parse_date(text: str, date_order: Optional[str] = None) -> tuple[Optional[str], Optional[str]]:
+    """ISO date from printed text. A numeric a/b/yyyy date where both orders are valid is ambiguous unless the
+    workspace configures the order ("MDY" or "DMY"); with a configured order, every numeric date is read in that
+    order and one that is invalid in it is not reinterpreted."""
     s = re.sub(r"\s+", " ", text.strip().rstrip("."))
     for fmt in _DATE_FORMATS:
         try:
             return datetime.strptime(s, fmt).date().isoformat(), None
         except ValueError:
             continue
-    m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", s)
+    m = _NUMERIC_DATE.match(s)
+    if m and date_order in ("MDY", "DMY"):
+        a, b, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        month, day = (a, b) if date_order == "MDY" else (b, a)
+        try:
+            return date(y, month, day).isoformat(), None
+        except ValueError:
+            return None, f"not a valid date in the workspace date order {date_order}"
     if m:
         a, b, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
         if a <= 12 and b <= 12 and a != b:
@@ -231,7 +249,7 @@ _NO_TAX = re.compile(r"^(not applicable|n/?a|none|nil|exempt|tax exempt|not taxa
 # Payment-instruction phrases. Only rows that carry a routing or account number are read as remittance details.
 # An identifier printed contiguous ("000123456789"), hyphen- or space-grouped ("0001-2345-6789", "0001 2345 6789").
 _GROUPED_ID = r"[0-9*xX•]{2,6}(?:[ \-][0-9*xX•]{2,6}){1,5}"
-_ROUTING_RE = re.compile(r"\b(?:ach\s+|aba\s+|wire\s+)?(?:routing|aba|rtn)(?:\s*(?:no\.?|number|#))?\s*[:#]?\s*"
+_ROUTING_RE = re.compile(r"\b(?:ach\s+|aba\s+|wire\s+)?(?:routing|aba|rtn|rtg)(?:\s*(?:no\.?|number|#))?\s*[:#]?\s*"
                          rf"({_GROUPED_ID}|[0-9*xX•]{{4,12}})(?![0-9])", re.IGNORECASE)
 _ACCOUNT_RE = re.compile(r"\b(?:account|acct\.?|a/c)(?:\s*(?:no\.?|number|#))?\s*[:#]?\s*"
                          rf"({_GROUPED_ID}|[0-9*xX•][0-9*xX•-]{{3,24}})(?![0-9])", re.IGNORECASE)
@@ -259,7 +277,8 @@ COLUMN_KEYS: dict[str, re.Pattern[str]] = {
     "sku": re.compile(r"^(item|sku|item code|product code|code|part( no\.?| number)?)$"),
     "description": re.compile(r"^(description|details|service|item description)$"),
     "quantity": re.compile(r"^(qty|quantity|hours|hrs|units)$"),
-    "unit_price": re.compile(r"^(unit price|rate|price|unit cost|unit rate)( \([a-z]{3}\))?$"),
+    # "EA" / "Each" headers print the price per unit ("Qty | Ea | Ext").
+    "unit_price": re.compile(r"^(unit price|rate|price|unit cost|unit rate|ea|each|price (ea|each))( \([a-z]{3}\))?$"),
     "amount": re.compile(r"^(amount|line total|total|net amount|net|ext|extended|ext(ended)? (amount|price)|extension)"
                          r"( \([a-z]{3}\))?$"),
 }
@@ -275,8 +294,10 @@ def _column_of(seg: Segment) -> Optional[str]:
 
 
 class InvoiceParser:
-    def __init__(self, tokens: list[Token]):
+    def __init__(self, tokens: list[Token], settings: Optional[dict] = None):
         self.tokens = tokens
+        # Optional workspace settings: "date_order" (MDY/DMY) and "default_currency". Absent = original behaviour.
+        self.settings = settings or {}
         self.rows: list[Row] = []
         self.slopes: dict[int, float] = {}
         for page in sorted({t.page for t in tokens}):
@@ -390,11 +411,20 @@ class InvoiceParser:
             self.inv.currency = Field_(raw=code, value=code, evidence=evidence_for(toks))
             return
         dollar = [t for t in self.tokens if t.text.startswith("$")]
+        default = self.settings.get("default_currency")
         if dollar:
             self.inv.currency = Field_(raw="$", value="USD", evidence=evidence_for([dollar[0]]),
                                        note="inferred from '$' symbol; no ISO code printed")
+        elif default:
+            # No marker on the document: the workspace's configured default applies, recorded as such.
+            self.inv.currency = Field_(value=default, source="workspace_config",
+                                       note=f"no currency code or symbol printed; {default} from the workspace "
+                                            f"configuration (default_currency)")
         else:
             self.inv.issues.append("currency: no currency code or symbol found")
+        if default and self.inv.currency.value and self.inv.currency.source is None and self.inv.currency.value != default:
+            self.inv.currency.note = ((self.inv.currency.note + "; ") if self.inv.currency.note else "") + (
+                f"printed currency takes precedence over the workspace default {default}")
 
     def _no_tax_wording(self) -> None:
         """A tax cell printed as words ("Not applicable", "Exempt") is zero tax only if the printed
@@ -555,18 +585,18 @@ class InvoiceParser:
         for row in self.rows[header_idx + 1:]:
             if row.page != header_row.page:
                 break
-            if any((m := _match_label(s)) and m[0] in TOTAL_KEYS for s in row.segments):
+            if any((m := _match_label(s)) and m[0] in TABLE_END_KEYS for s in row.segments):
                 break
             cells: dict[str, list[Token]] = {}
             for tok in row.tokens:
                 placed = False
                 for c, s in cols:
                     if c in NUMERIC_COLS and tok.x1 >= s.x0 - slack and tok.x0 <= s.x1 + slack:
-                        if parse_decimal_amount(tok.text) is not None:
+                        if self._rate(tok.text) is not None:
                             cells.setdefault(c, []).append(tok)
                             placed = True
                             break
-                if not placed and parse_decimal_amount(tok.text) is not None:
+                if not placed and self._rate(tok.text) is not None:
                     # A figure under no header: use the column band. Numbers inside a text column's
                     # band (dimensions or counts in a description) stay text.
                     c = band_column(tok)
@@ -595,6 +625,24 @@ class InvoiceParser:
             self.inv.issues.append("lines: table header found but no line rows with an amount")
         for i, cells in enumerate(items):
             self.inv.lines.append(self._line(i, cells))
+
+    @cached_property
+    def _us_amount_example(self) -> Optional[str]:
+        """A printed amount proving '.' is this document's decimal mark ("1,250.00"), if the document has one and
+        prints no amount in the opposite convention ("2.070,00")."""
+        us = [t.text for t in self.tokens if re.fullmatch(r"\$?\d{1,3}(,\d{3})+\.\d{2}", t.text)]
+        eu = [t.text for t in self.tokens if re.fullmatch(r"\$?\d{1,3}(\.\d{3})+,\d{2}", t.text)]
+        return us[0] if us and not eu else None
+
+    def _rate(self, raw: str) -> Optional[Decimal]:
+        """Unit price/rate. A three- or four-decimal rate ("2.125", "0.375") that the money parser leaves ambiguous
+        is read as a decimal when it starts with "0." or the document's own amounts use '.' as the decimal mark."""
+        d = parse_decimal_amount(raw)
+        if d is not None or not re.fullmatch(r"\d+\.\d{3,4}", raw.strip()):
+            return d
+        if raw.strip().startswith("0.") or self._us_amount_example:
+            return Decimal(raw.strip())
+        return None
 
     def _line(self, i: int, cells: dict[str, list[Token]]) -> LineItem:
         def text_field(c: str) -> Field_:
@@ -625,7 +673,10 @@ class InvoiceParser:
             sku.value = norm_identifier(sku.value)
         q = num_field("quantity", lambda r: (lambda d: norm_decimal(d) if d is not None else None)(parse_quantity(r)))
         up = num_field("unit_price",
-                       lambda r: (lambda d: norm_decimal(d) if d is not None else None)(parse_decimal_amount(r)))
+                       lambda r: (lambda d: norm_decimal(d) if d is not None else None)(self._rate(r)))
+        if up.value is not None and up.raw and parse_decimal_amount(up.raw) is None:
+            up.note = (f"rate {up.raw!r} read with '.' as the decimal mark: the document prints amounts as "
+                       f"{self._us_amount_example}" if self._us_amount_example else f"rate {up.raw!r} below 1")
         amt = num_field("amount", parse_money_cents)
         return LineItem(row_index=i, sku=sku, description=text_field("description"), quantity=q,
                         unit_price=up, amount=amt)
@@ -635,13 +686,22 @@ class InvoiceParser:
         self._supplier()
         self._assign("invoice_number", labelled.get("invoice_number", []),
                      lambda r: (norm_identifier(r), None) if re.search(r"\d", r) else (None, "no digits"))
-        self._assign("invoice_date", labelled.get("invoice_date", []), parse_date)
+        order = self.settings.get("date_order")
+        self._assign("invoice_date", labelled.get("invoice_date", []), lambda r: parse_date(r, order))
+        d = self.inv.invoice_date
+        if order and d.value and d.raw and _NUMERIC_DATE.match(d.raw.strip()):
+            d.note = f"numeric date {d.raw!r} read as {order} (workspace date order)"
+            d.source = "workspace_config"
         self._assign("po_reference", labelled.get("po_reference", []),
                      lambda r: (norm_identifier(r), None) if re.search(r"\d", r) else (None, "no digits"))
+        net_labels = [label for _t, label, _c in labelled.get("net", [])]
         for key in TOTAL_KEYS:
             # Use the right-most money token of the value segment.
             cands = []
             for toks, label, cur in labelled.get(key, []):
+                if key == "freight" and net_labels and not any(
+                        (label[0].page, label[0].y0) >= (n[0].page, n[0].y0 - 1) for n in net_labels):
+                    continue  # a freight/shipping word above the subtotal (a line item) is not the totals charge
                 money = [t for t in toks if parse_decimal_amount(t.text) is not None]
                 cands.append((money[-1:] or toks, label, cur))
             self._assign(key, cands,
@@ -659,8 +719,8 @@ class InvoiceParser:
         return self.inv
 
 
-def parse_invoice(tokens: Iterable[Token]) -> tuple[ExtractedInvoice, dict[int, float]]:
-    p = InvoiceParser(list(tokens))
+def parse_invoice(tokens: Iterable[Token], settings: Optional[dict] = None) -> tuple[ExtractedInvoice, dict[int, float]]:
+    p = InvoiceParser(list(tokens), settings)
     return p.parse(), p.slopes
 
 

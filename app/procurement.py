@@ -185,12 +185,35 @@ def validate(files: dict[str, tuple[str, bytes]]) -> Parsed:
     return out
 
 
-def import_procurement(conn, files: dict[str, tuple[str, bytes]]) -> dict[str, Any]:
+DATE_ORDERS = ("MDY", "DMY")
+
+
+def validate_settings(date_order: str | None, default_currency: str | None) -> dict[str, str]:
+    """Optional workspace settings. Empty values mean "not configured" (ambiguous dates and missing currency hold)."""
+    errors, out = [], {}
+    if date_order and date_order.strip():
+        v = date_order.strip().upper()
+        if v not in DATE_ORDERS:
+            errors.append(f"date_order must be one of {', '.join(DATE_ORDERS)}")
+        out["date_order"] = v
+    if default_currency and default_currency.strip():
+        v = default_currency.strip().upper()
+        if not re.fullmatch(r"[A-Z]{3}", v):
+            errors.append("default_currency must be a 3-letter ISO code")
+        out["default_currency"] = v
+    if errors:
+        raise ImportError_(errors)
+    return out
+
+
+def import_procurement(conn, files: dict[str, tuple[str, bytes]], settings: dict[str, str] | None = None) -> dict[str, Any]:
     parsed = validate(files)
+    settings = settings or {}
     ws = "ws_" + uuid.uuid4().hex[:12]
     with transaction(conn):
-        conn.execute("INSERT INTO workspaces (id, created_at, source_files_json) VALUES (?,?,?)",
-                     (ws, now_iso(), json.dumps({role: f[0] for role, f in files.items()})))
+        conn.execute("INSERT INTO workspaces (id, created_at, source_files_json, date_order, default_currency)"
+                     " VALUES (?,?,?,?,?)", (ws, now_iso(), json.dumps({role: f[0] for role, f in files.items()}),
+                                             settings.get("date_order"), settings.get("default_currency")))
         conn.executemany(
             "INSERT INTO vendors (workspace_id, vendor_id, legal_name, legal_name_norm, status, source_file, source_row,"
             " bank_name, routing_number, account_number, verification_phone) VALUES (:ws,:vendor_id,:legal_name,"
@@ -204,4 +227,4 @@ def import_procurement(conn, files: dict[str, tuple[str, bytes]]) -> dict[str, A
             "INSERT INTO po_lines VALUES (:ws,:po_id,:line_id,:sku,:description,:authorized_quantity,:unit_price,"
             ":authorized_net_cents,:source_file,:source_row)", [{**l, "ws": ws} for l in parsed.lines])
     return {"workspace_id": ws, "vendors": len(parsed.vendors), "purchase_orders": len(parsed.pos),
-            "po_lines": len(parsed.lines)}
+            "po_lines": len(parsed.lines), "settings": settings}
