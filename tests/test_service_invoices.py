@@ -6,7 +6,7 @@ import pytest
 
 from app.extraction import extract
 from app.extraction.parser import parse_period
-from app.models import Field_, LineItem
+from app.models import Evidence, Field_, LineItem
 from app.procurement import norm_name
 from app.rules import Snapshot, evaluate
 from tests.conftest import wait_for
@@ -51,9 +51,11 @@ def svc_invoice(number="CNS-118", period="2026-03", date="2026-03-31", supplier=
                    net=f(ln.amount.value), tax=f(0, raw="Not applicable"), gross=f(ln.amount.value), lines=[ln], **kw)
 
 
-def accepted(number="CNS-118", period="2026-03", date="2026-03-31", qty="1", net=180000):
+def accepted(number="CNS-118", period="2026-03", date="2026-03-31", qty="1", net=180000, period_conf=95.0):
+    # The ledger snapshot carries the accepted run's period value, printed text and evidence confidence.
     return {"id": 1, "run_id": "run_prev", "vendor_id": "V1", "invoice_number_norm": number, "po_id": "PO-S1",
-            "invoice_date": date, "service_period": period, "created_at": "2026-04-02T10:00:00.000+00:00",
+            "invoice_date": date, "service_period": period, "service_period_raw": "March 2026" if period else None,
+            "service_period_conf": period_conf if period else None, "created_at": "2026-04-02T10:00:00.000+00:00",
             "currency": "USD", "net_cents": net, "tax_cents": 0, "gross_cents": net,
             "lines": [{"line_id": "1", "sku": "NET-MSP", "quantity": qty, "unit_price": "1800", "net_cents": net}]}
 
@@ -105,7 +107,8 @@ def test_description_only_line_maps_to_a_unique_po_line_and_keeps_sku_null():
     m = d.line_matches[0]
     assert (m["method"], m["invoice_sku"], m["po_line_id"], m["po_sku"], m["source"]) == (
         "description", None, "1", "NET-MSP", "po_lines.csv row 2")
-    assert m["shared_words"] == ["fee", "managed", "network", "services"]
+    assert m["shared_words"] == ["managed", "network"]  # identifying words; "services", "fee" are generic
+    assert m["missing_words"] == [] and m["conflicts"] == []
     assert d.allocation["lines"] == [{"line_id": "1", "sku": "NET-MSP", "quantity": "1", "unit_price": "1800",
                                       "net_cents": 180000}]
     assert d.price_check["lines"][0]["invoice_sku"] is None and d.price_check["lines"][0]["sku"] == "NET-MSP"
@@ -113,10 +116,50 @@ def test_description_only_line_maps_to_a_unique_po_line_and_keeps_sku_null():
 
 def test_description_matching_two_po_lines_holds():
     lines = [po_line("1", "NET-MSP", MSP_DESC, "12", "1800", 2160000, 2),
-             po_line("2", "NET-MSP-B", "Managed network services monthly fee - site B", "12", "1800", 2160000, 3)]
+             po_line("2", "NET-MSP-B", "Network services, managed - monthly", "12", "1800", 2160000, 3)]
     d = run(svc_invoice(), snap(lines=lines))
     assert (d.decision, d.reason_code, d.allocation) == ("HOLD", "LINE_NOT_ON_PO", None)
     assert "more than one line" in d.reason and d.line_matches[0]["status"] == "ambiguous"
+
+
+def test_conflicting_service_qualifier_holds_despite_overlapping_generic_words():
+    # Same price, quantity and generic words ("network services monthly fee"), but "unmanaged" contradicts "managed".
+    lines = [po_line("1", "NET-MSP", "Managed network services - monthly fee", "12", "1800", 2160000, 2)]
+    inv = svc_invoice(line=svc_line(desc="Unmanaged network services - monthly fee"))
+    d = run(inv, snap(lines=lines))
+    assert (d.decision, d.reason_code, d.allocation) == ("HOLD", "LINE_NOT_ON_PO", None)
+    assert inv.lines[0].sku.value is None
+    cand = d.line_matches[0]["candidates"][0]
+    assert cand["qualifies"] is False and cand["missing_words"] == ["managed"]
+    assert cand["conflicts"] == ["'unmanaged' (invoice) vs 'managed' (PO)"]
+    assert "missing managed" in d.reason and "'unmanaged' (invoice) vs 'managed' (PO)" in d.reason
+
+
+@pytest.mark.parametrize("desc,conflict", [
+    ("Managed network services - annual fee", "'annual' (invoice) vs 'monthly' (PO) [frequency]"),
+    ("Managed network services, excluding firewall - monthly fee", "negation 'excluding' in the invoice description"),
+    ("Non-managed network services - monthly fee", "negation 'non' in the invoice description"),
+])
+def test_contradicting_qualifiers_hold(desc, conflict):
+    lines = [po_line("1", "NET-MSP", "Managed network services - monthly fee", "12", "1800", 2160000, 2)]
+    d = run(svc_invoice(line=svc_line(desc=desc)), snap(lines=lines))
+    assert (d.decision, d.reason_code, d.allocation) == ("HOLD", "LINE_NOT_ON_PO", None)
+    assert conflict in d.line_matches[0]["candidates"][0]["conflicts"]
+
+
+def test_legitimate_wording_differences_still_match():
+    # Reordered words, punctuation, a billing month and extra detail; every identifying word is present.
+    inv = svc_invoice(line=svc_line(desc="Network services (managed) - fee for April 2026, incl. firewall monitoring"))
+    d = run(inv, snap())
+    assert d.decision == "READY" and d.line_matches[0]["po_sku"] == "NET-MSP"
+    assert d.line_matches[0]["shared_words"] == ["managed", "network"] and inv.lines[0].sku.value is None
+
+
+def test_po_line_with_only_generic_words_cannot_be_matched():
+    lines = [po_line("1", "SVC-FEE", "Monthly services fee", "12", "1800", 2160000, 2)]
+    d = run(svc_invoice(line=svc_line(desc="Monthly services fee - March 2026")), snap(lines=lines))
+    assert (d.decision, d.reason_code) == ("HOLD", "LINE_NOT_ON_PO")
+    assert "only 0 identifying word(s)" in d.reason
 
 
 def test_description_matching_no_po_line_holds():
@@ -176,6 +219,35 @@ def test_leading_zero_variant_without_period_corroboration_runs_the_normal_check
     d = run(svc_invoice(number="CNS-0118", period=period), snap(allocations=[accepted()]))
     assert d.decision == "READY" and d.duplicate["outcome"] == "no_match"
     assert d.duplicate["near_matches"][0]["outcome"] == "variant_not_corroborated"
+
+
+def _low_conf_period(value="2026-03", raw="March 2026", conf=62.0):
+    return Field_(raw=raw, value=value, evidence=Evidence(page=1, method="ocr", text=raw, bbox=(0, 0, 1, 1), conf=conf))
+
+
+def test_resend_with_unclear_service_period_is_held_not_blocked():
+    inv = svc_invoice(number="CNS-0118")
+    inv.service_period = _low_conf_period()
+    d = run(inv, snap(allocations=[accepted()]))
+    assert (d.decision, d.reason_code, d.allocation) == ("HOLD", "DUPLICATE_IDENTITY_UNCERTAIN", None)
+    assert d.duplicate["outcome"] == "variant_period_unclear" and d.duplicate["accepted"]["run_id"] == "run_prev"
+    assert d.duplicate["business_key"]["invoice_number"] == "CNS-0118"  # printed number kept
+    row = next(r for r in d.duplicate["comparison"] if r["field"] == "service_period")
+    assert (row["status"], row["incoming_conf"], row["accepted_conf"]) == ("unclear", 62.0, 95.0)
+    assert "service period cannot be verified" in d.reason and "confidence 62.0" in d.reason
+    assert d.review_field == "service_period"
+
+
+def test_resend_whose_accepted_period_was_unclear_is_held_not_blocked():
+    d = run(svc_invoice(number="CNS-0118"), snap(allocations=[accepted(period_conf=55.0)]))
+    assert (d.decision, d.reason_code) == ("HOLD", "DUPLICATE_IDENTITY_UNCERTAIN")
+    assert d.duplicate["outcome"] == "variant_period_unclear"
+
+
+def test_unclear_period_never_affects_a_new_invoice_number():
+    inv = svc_invoice(number="CNS-131", period="2026-04", date="2026-04-30")
+    inv.service_period = _low_conf_period(value="2026-04", raw="April 2026")
+    assert run(inv, snap(allocations=[accepted()])).decision == "READY"
 
 
 def test_exact_invoice_number_is_still_blocked_by_the_existing_rule():

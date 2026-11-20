@@ -21,7 +21,9 @@ def load_snapshot(conn: sqlite3.Connection, workspace_id: str) -> Snapshot:
         lines.setdefault(r["po_id"], []).append(dict(r))
     allocs = []
     for a in conn.execute("SELECT a.*, r.created_at AS run_created_at, r.invoice_date AS invoice_date,"
-                          " json_extract(r.extraction_json, '$.invoice.service_period.value') AS service_period"
+                          " json_extract(r.extraction_json, '$.invoice.service_period.value') AS service_period,"
+                          " json_extract(r.extraction_json, '$.invoice.service_period.raw') AS service_period_raw,"
+                          " json_extract(r.extraction_json, '$.invoice.service_period.evidence.conf') AS service_period_conf"
                           " FROM allocations a JOIN runs r ON r.id=a.run_id"
                           " WHERE a.workspace_id=? ORDER BY a.id", (workspace_id,)):
         d = dict(a)

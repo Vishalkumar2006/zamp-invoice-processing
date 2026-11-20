@@ -83,7 +83,7 @@ def evaluate(inv: ExtractedInvoice, snap: Snapshot, *, min_conf: float, policy_v
         _evidence(inv, min_conf, check)
         vendor = _vendor(inv, snap, check, ctx)
         ctx["vendor"] = vendor
-        _duplicate(inv, snap, vendor, check, ctx)
+        _duplicate(inv, snap, vendor, check, ctx, min_conf)
         po = _po(inv, snap, vendor, check, ctx)
         ctx["po"] = po
         _arithmetic(inv, check)
@@ -170,7 +170,7 @@ LEGAL_SUFFIXES = ("incorporated", "inc", "l l c", "llc", "limited", "ltd", "comp
 
 
 def split_legal_suffix(normalized: str) -> tuple[str, str]:
-    """("brightpath it services inc") -> ("brightpath it services", "inc"); no suffix -> (name, "")."""
+    """("acme field services inc") -> ("acme field services", "inc"); no suffix -> (name, "")."""
     words = normalized.split()
     for suf in sorted(LEGAL_SUFFIXES, key=lambda s: -len(s.split())):
         sw = suf.split()
@@ -255,18 +255,71 @@ def description_words(text: Optional[str]) -> set[str]:
             if len(w) >= 3 and not w.isdigit() and w not in _MONTH_WORDS and w not in _DESC_STOP}
 
 
+# Billing words that say how a charge is billed, not what the service is. They never identify a line.
+_GENERIC_WORDS = {"fee", "fees", "charge", "charges", "monthly", "weekly", "quarterly", "annual", "annually", "yearly",
+                  "retainer", "subscription", "plan", "service", "services", "recurring", "billing", "period",
+                  "renewal", "cost", "costs", "rate", "rates", "misc", "miscellaneous", "general", "item", "items"}
+_PERIOD_TOKEN = re.compile(r"^(fy|q[1-4]|h[12])?\d{2,4}$")
+# Mutually exclusive qualifiers: a PO line naming one and an invoice naming another (and not the first) conflict.
+_EXCLUSIVE = {w: (g, c) for g, members in {
+    "frequency": {"monthly": "monthly", "weekly": "weekly", "quarterly": "quarterly", "annual": "annual",
+                  "annually": "annual", "yearly": "annual"},
+    "location": {"onsite": "onsite", "offsite": "offsite", "remote": "remote"},
+    "role": {"primary": "primary", "secondary": "secondary", "backup": "backup"},
+    "tier": {"basic": "basic", "standard": "standard", "premium": "premium", "advanced": "advanced",
+             "enterprise": "enterprise"},
+}.items() for w, c in members.items()}
+_NEGATING_PREFIXES = ("un", "non", "dis", "in", "de", "anti", "semi", "bi", "self")
+_NEGATION_WORDS = {"non", "not", "without", "excluding", "except", "excl", "excludes", "excluded"}
+
+
+def _description_conflicts(inv_text: Optional[str], inv_words: set[str], po_words: set[str]) -> list[str]:
+    """Qualifiers on the invoice that contradict the PO line: a negated or prefixed form of a PO word
+    ("unmanaged" vs "managed"), a negation word, or a different member of an exclusive group (monthly vs annual)."""
+    out = []
+    for w in sorted(inv_words - po_words):
+        for p in sorted(po_words):
+            if any(w == pre + p or p == pre + w for pre in _NEGATING_PREFIXES):
+                out.append(f"'{w}' (invoice) vs '{p}' (PO)")
+    tokens = set(norm_name(inv_text or "").split())
+    out += [f"negation '{t}' in the invoice description" for t in sorted(tokens & _NEGATION_WORDS)]
+    po_groups = {}
+    for p in po_words:
+        if p in _EXCLUSIVE:
+            g, c = _EXCLUSIVE[p]
+            po_groups.setdefault(g, set()).add(c)
+    for w in sorted(inv_words):
+        if w in _EXCLUSIVE:
+            g, c = _EXCLUSIVE[w]
+            if g in po_groups and c not in po_groups[g]:
+                out.append(f"'{w}' (invoice) vs '{'/'.join(sorted(po_groups[g]))}' (PO) [{g}]")
+    return out
+
+
 def match_description(description: Optional[str], po_lines: list[dict[str, Any]]) -> dict[str, Any]:
-    """Map a line with no printed SKU to a PO line by description. A PO line qualifies when the invoice
-    description contains at least 2 of its meaningful words and at least 60% of them. Exactly one line on
-    the PO must qualify; otherwise there is no match (none) or no defensible choice (ambiguous)."""
+    """Map a line with no printed SKU to a PO line by description.
+
+    A PO line's meaningful words split into generic billing words (fee, monthly, services, ...) and identity
+    words (what the service is). The line qualifies only if it has at least 2 identity words, the invoice
+    description contains every one of them, and no invoice qualifier contradicts the PO line (negated forms,
+    negation words, a different member of an exclusive group). Overlapping generic words never decide.
+    Exactly one line on the PO must qualify; otherwise there is no match (none) or no defensible choice
+    (ambiguous). Each candidate keeps the full comparison."""
     inv_words = description_words(description)
     cands = []
     for pl in po_lines:
-        po_words = description_words(pl.get("description"))
-        shared = sorted(po_words & inv_words)
-        qualifies = len(shared) >= 2 and len(shared) * 5 >= len(po_words) * 3
+        meaningful = {w for w in description_words(pl.get("description")) if not _PERIOD_TOKEN.match(w)}
+        identity = meaningful - _GENERIC_WORDS
+        present = sorted(identity & inv_words)
+        missing = sorted(identity - inv_words)
+        conflicts = _description_conflicts(description, inv_words, meaningful)
+        problems = ([f"only {len(identity)} identifying word(s) on the PO line"] if len(identity) < 2 else []) + (
+            [f"missing {', '.join(missing)}"] if missing else []) + ([f"conflicting: {'; '.join(conflicts)}"]
+                                                                     if conflicts else [])
         cands.append({"po_line_id": pl["line_id"], "po_sku": pl["sku"], "po_description": pl.get("description"),
-                      "po_words": sorted(po_words), "shared_words": shared, "qualifies": qualifies,
+                      "po_words": sorted(identity), "generic_words": sorted(meaningful & _GENERIC_WORDS),
+                      "shared_words": present, "missing_words": missing, "conflicts": conflicts,
+                      "qualifies": not problems, "problems": problems,
                       "source": f"{pl['source_file']} row {pl['source_row']}" if "source_file" in pl else None})
     ok = [c for c in cands if c["qualifies"]]
     status = "matched" if len(ok) == 1 else ("ambiguous" if ok else "no_match")
@@ -295,7 +348,8 @@ def _accepted_record(a: dict[str, Any]) -> dict[str, Any]:
     return {"run_id": a["run_id"], "allocation_id": a.get("id"), "invoice_number": a["invoice_number_norm"],
             "invoice_date": a.get("invoice_date"), "accepted_at": a.get("created_at"), "po_id": a["po_id"],
             "currency": a["currency"], "net_cents": a["net_cents"], "tax_cents": a["tax_cents"],
-            "gross_cents": a["gross_cents"], "service_period": a.get("service_period")}
+            "gross_cents": a["gross_cents"], "service_period": a.get("service_period"),
+            "service_period_conf": a.get("service_period_conf")}
 
 
 def _compare_with_accepted(inv: ExtractedInvoice, a: dict[str, Any],
@@ -342,7 +396,7 @@ def _compare_with_accepted(inv: ExtractedInvoice, a: dict[str, Any],
     return rows
 
 
-def _duplicate(inv, snap: Snapshot, vendor, check, ctx) -> None:
+def _duplicate(inv, snap: Snapshot, vendor, check, ctx, min_conf: float = 80) -> None:
     """Business duplicate: approved vendor ID + conservatively normalised printed invoice number,
     looked up against previously *accepted* (allocated) invoices only. Held or blocked runs never
     count, so a corrected resubmission after a HOLD is evaluated normally."""
@@ -356,7 +410,7 @@ def _duplicate(inv, snap: Snapshot, vendor, check, ctx) -> None:
     ctx["duplicate"] = dup
 
     if not exact:
-        _number_variant(inv, snap, vendor, accepted, key, check, ctx, dup)
+        _number_variant(inv, snap, vendor, accepted, key, check, ctx, dup, min_conf)
         # Fail closed on uncertain identity: an OCR-read number that differs from an accepted number
         # of the same vendor only by OCR-confusable characters is not a verified distinct number.
         ev = inv.invoice_number.evidence
@@ -424,29 +478,67 @@ def _duplicate(inv, snap: Snapshot, vendor, check, ctx) -> None:
                 review_field="invoice_" + ("date" if conflicts[0]["field"] == "invoice_date" else "number"))
 
 
-def _number_variant(inv, snap: Snapshot, vendor, accepted, key, check, ctx, dup) -> None:
+def _period_row(inv: ExtractedInvoice, a: dict[str, Any], min_conf: float) -> dict[str, Any]:
+    """Service period compared only on reliable evidence: parsed and read at confidence >= min_conf on BOTH
+    the incoming document and the accepted invoice. status: match | conflict (both reliable) | unclear (printed
+    on either side but unparsed or below the floor) | missing (printed on neither)."""
+    sp = inv.service_period
+    inc_conf = sp.evidence.conf if sp.evidence else None
+    inc_ok = sp.value is not None and inc_conf is not None and inc_conf >= min_conf
+    acc_value, acc_conf, acc_raw = a.get("service_period"), a.get("service_period_conf"), a.get("service_period_raw")
+    acc_ok = acc_value is not None and acc_conf is not None and acc_conf >= min_conf
+    if inc_ok and acc_ok:
+        status = "match" if sp.value == acc_value else "conflict"
+    elif (sp.raw is not None and not inc_ok) or ((acc_value is not None or acc_raw is not None) and not acc_ok):
+        status = "unclear"
+    else:
+        status = "missing"
+    return {"field": "service_period", "incoming": sp.value, "accepted": acc_value, "money": False, "status": status,
+            "incoming_raw": sp.raw, "incoming_conf": inc_conf, "accepted_raw": acc_raw, "accepted_conf": acc_conf,
+            "min_conf": min_conf}
+
+
+def _number_variant(inv, snap: Snapshot, vendor, accepted, key, check, ctx, dup, min_conf: float = 80) -> None:
     """A printed number equal to an accepted number of the same vendor apart from leading zeros
-    ("INV-0417" vs "INV-417"). It is routed to a duplicate outcome only when corroborated: the same PO,
-    service period (printed on both) and billing details (currency, net, tax, gross, lines).
-      - corroborated and the same invoice date -> BLOCKED DUPLICATE_INVOICE, linked to the accepted run;
-      - corroborated but a different invoice date (a re-dated copy) -> HOLD DUPLICATE_IDENTITY_UNCERTAIN.
-    Otherwise the variant is recorded and the normal checks run: same vendor, PO and amount alone are not
-    enough to call it a duplicate."""
+    ("INV-0417" vs "INV-417"). Compared on PO and billing details (currency, net, tax, gross, lines) and on the
+    service period, which counts only when read reliably on both records (see _period_row).
+      - billing matches, period matches reliably, same invoice date -> BLOCKED DUPLICATE_INVOICE (linked);
+      - billing matches, period matches reliably, different date (re-dated copy) -> HOLD DUPLICATE_IDENTITY_UNCERTAIN;
+      - billing matches but the period is unclear on either record -> HOLD DUPLICATE_IDENTITY_UNCERTAIN;
+      - otherwise (different reliable period, period printed on neither, billing differs) -> recorded, and the
+        normal checks run: same vendor, PO and amount alone are not enough to call it a duplicate."""
     variants = [a for a in accepted
                 if a["invoice_number_norm"] != key and _unpadded(a["invoice_number_norm"]) == _unpadded(key)]
     for a in variants:
         comparison = _compare_with_accepted(inv, a, snap)
-        inc_p, acc_p = inv.service_period.value, a.get("service_period")
-        comparison.append({"field": "service_period", "incoming": inc_p, "accepted": acc_p, "money": False,
-                           "status": "match" if inc_p is not None and inc_p == acc_p else
-                           ("missing" if inc_p is None or acc_p is None else "conflict")})
-        corroborating = [r for r in comparison if r["field"] != "invoice_date"]
-        corroborated = all(r["status"] == "match" for r in corroborating)
+        period = _period_row(inv, a, min_conf)
+        comparison.append(period)
+        acc_p = a.get("service_period")
+        billing_match = all(r["status"] == "match" for r in comparison if r["field"] not in ("invoice_date", "service_period"))
         same_date = next(r for r in comparison if r["field"] == "invoice_date")["status"] == "match"
         num = a["invoice_number_norm"]
         record = {"accepted": _accepted_record(a), "comparison": comparison,
                   "number_variant": {"printed": key, "accepted": num, "rule": "equal apart from leading zeros"}}
-        if not corroborated:
+        if billing_match and period["status"] == "unclear":
+            dup.update(record, outcome="variant_period_unclear")
+            ctx["po"] = snap.pos.get(a["po_id"])
+            ctx["prior"] = [{"run_id": a["run_id"], "invoice_number_norm": num, "po_id": a["po_id"],
+                             "net_cents": a["net_cents"], "gross_cents": a["gross_cents"]}]
+            show = lambda raw, val, conf: (f"\"{raw}\"" if raw else "not printed") + (
+                f" read as {val}" if val else "") + (f" at confidence {conf}" if conf is not None else "")
+            check("duplicate", False, f"{vendor['vendor_id']} / {key} matches accepted {num} (run {a['run_id']}) apart "
+                  f"from leading zeros, but the service period is unclear", accepted_run=a["run_id"])
+            raise _Stop("HOLD", "DUPLICATE_IDENTITY_UNCERTAIN",
+                        f"Invoice {key} matches accepted invoice {num} (run {a['run_id']}) apart from leading zeros, with "
+                        f"the same PO {a['po_id']} and billing details" + (" and invoice date" if same_date else "")
+                        + f", but the service period cannot be verified (minimum confidence {min_conf}): this document "
+                        f"{show(period['incoming_raw'], period['incoming'], period['incoming_conf'])}; accepted invoice "
+                        f"{show(period['accepted_raw'], period['accepted'], period['accepted_conf'])}. A resend can be "
+                        f"neither confirmed nor ruled out.",
+                        f"Check the service period on this PDF and on {num} (run {a['run_id']}). Same period: close "
+                        f"this as a duplicate. Different period: ask {vendor['legal_name']} for a distinct invoice number.",
+                        review_field="service_period")
+        if not (billing_match and period["status"] == "match"):
             dup.setdefault("near_matches", []).append({**record, "outcome": "variant_not_corroborated"})
             continue
         dup.update(record, outcome="variant_corroborated" if same_date else "variant_uncertain")
@@ -661,15 +753,18 @@ def _line_mapping(inv, snap: Snapshot, po, check, ctx) -> list[tuple[Any, dict[s
             rec = {"line": i, "method": "description", "invoice_sku": None, "invoice_description": line.description.value,
                    "invoice_description_evidence": ev.model_dump() if ev else None, "status": m["status"],
                    "invoice_words": m["invoice_words"], "candidates": m["candidates"], "po_id": po["po_id"],
-                   "rule": "at least 2 and at least 60% of the PO line's meaningful words; exactly one qualifying line"}
+                   "rule": "every identifying word of the PO line (at least 2) present, no conflicting qualifier; "
+                           "exactly one qualifying line"}
             records.append(rec)
             hit = m["match"]
             if hit is None or hit["po_line_id"] in seen:
+                compared = "; ".join(f"line {c['po_line_id']} {c['po_sku']} \"{c['po_description']}\": "
+                                     + ", ".join(c["problems"]) for c in m["candidates"] if c["problems"])
                 why = ("its description fits more than one line: " + ", ".join(
                     f"line {c['po_line_id']} {c['po_sku']}" for c in m["candidates"] if c["qualifies"])
                        if m["status"] == "ambiguous" else
                        "it is already mapped to another invoice line" if hit else
-                       "its description does not clearly match any line")
+                       f"its description \"{line.description.value}\" does not clearly match any line ({compared})")
                 check("line_mapping", False, f"line {i} (no SKU printed) on {po['po_id']}: {why}",
                       description=line.description.value, candidates=m["candidates"])
                 raise _Stop("HOLD", "LINE_NOT_ON_PO",
@@ -679,11 +774,12 @@ def _line_mapping(inv, snap: Snapshot, po, check, ctx) -> list[tuple[Any, dict[s
             seen.add(pl["line_id"])
             mapping.append((line, pl))
             rec.update(po_line_id=pl["line_id"], po_sku=pl["sku"], po_description=pl.get("description"),
-                       shared_words=hit["shared_words"], po_words=hit["po_words"],
+                       shared_words=hit["shared_words"], po_words=hit["po_words"], missing_words=hit["missing_words"],
+                       conflicts=hit["conflicts"], generic_words=hit["generic_words"],
                        source=f"{pl['source_file']} row {pl['source_row']}")
             check("line_mapping", True, f"line {i} (no SKU printed) -> {po['po_id']} line {pl['line_id']} {pl['sku']} "
-                  f"by description: shares {', '.join(hit['shared_words'])} ({len(hit['shared_words'])} of "
-                  f"{len(hit['po_words'])} PO-line words); the only qualifying line",
+                  f"by description: contains every identifying word of the PO line ({', '.join(hit['shared_words'])}), "
+                  f"no conflicting qualifier; the only qualifying line",
                   po_line=pl["line_id"], source=rec["source"], match_method="description")
             continue
         pl = by_sku.get(line.sku.value)

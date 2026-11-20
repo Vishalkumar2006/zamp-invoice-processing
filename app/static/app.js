@@ -126,7 +126,8 @@ function renderDuplicate(d) {
   const title = { corroborated: "Duplicate of an accepted invoice", conflict: "Same invoice number, different content",
     identity_uncertain: "Possible duplicate (uncertain OCR identity)",
     variant_corroborated: "Duplicate of an accepted invoice (number printed with leading zeros)",
-    variant_uncertain: "Possible duplicate (number differs only by leading zeros; different date)" }[dup.outcome]
+    variant_uncertain: "Possible duplicate (number differs only by leading zeros; different date)",
+    variant_period_unclear: "Possible duplicate (number differs only by leading zeros; service period unclear)" }[dup.outcome]
     || "Duplicate check";
   return `<h3 class="sub">${esc(title)}</h3>
     <dl class="kv">
@@ -275,10 +276,11 @@ function lineMatches(d) {
   if (!rows.length) return "";
   return `<dt>Line mapping</dt><dd>${rows.map((m) => m.po_line_id
     ? `Line ${esc(m.line)} (no SKU printed) → ${esc(m.po_id)} line ${esc(m.po_line_id)} ${esc(m.po_sku)}
-       (${esc(m.source)}) by description: shares ${esc((m.shared_words || []).join(", "))}
-       (${esc((m.shared_words || []).length)} of ${esc((m.po_words || []).length)} PO-line words); the only qualifying line`
+       (${esc(m.source)}) by description: contains every identifying word of the PO line
+       (${esc((m.shared_words || []).join(", "))}), no conflicting qualifier; the only qualifying line`
     : `Line ${esc(m.line)} (no SKU printed): ${esc(m.status === "ambiguous" ? "description fits more than one PO line"
-       : "description matches no PO line")}`).join("<br>")}</dd>`;
+       : "description matches no PO line")}${(m.candidates || []).map((c) => `<br><span class="muted">vs line
+       ${esc(c.po_line_id)} ${esc(c.po_sku)} “${esc(c.po_description)}”: ${esc((c.problems || []).join(", ") || "qualifies")}</span>`).join("")}`).join("<br>")}</dd>`;
 }
 
 function renderEvidence(x) {

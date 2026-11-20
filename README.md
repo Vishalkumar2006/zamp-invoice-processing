@@ -132,20 +132,26 @@ upload ─► persist PDF + run (QUEUED) ─► worker claims run
   line differences cancel out, the hold says so explicitly. Tax is reported separately; authorization and
   allocations stay pre-tax. The next action names each affected line and its PO price.
 - **Leading-zero variants.** A printed number equal to an accepted number of the same vendor apart from leading
-  zeros (`INV-0417` vs `INV-417`) is kept as printed and compared with the accepted invoice: PO, service period
-  (printed on both), currency, net, tax, total and lines. Fully corroborated with the same invoice date, it is
-  `BLOCKED / DUPLICATE_INVOICE`, linked to the accepted run; corroborated but re-dated, it is
-  `HOLD / DUPLICATE_IDENTITY_UNCERTAIN`. Otherwise the variant is recorded and the normal checks run: the same
+  zeros (`INV-0417` vs `INV-417`) is kept as printed and compared with the accepted invoice: PO, currency, net,
+  tax, total, lines and service period. The service period counts only when parsed and read at confidence 80 or
+  above on both records. Billing and a reliable period match with the same invoice date: `BLOCKED /
+  DUPLICATE_INVOICE`, linked to the accepted run. Re-dated, or billing matches but either period is unclear:
+  `HOLD / DUPLICATE_IDENTITY_UNCERTAIN`, with both readings shown. Otherwise (a different reliable period, no
+  period printed on either, or different billing) the variant is recorded and the normal checks run: the same
   vendor, PO and amount alone never make a duplicate.
 - **Vendor names.** The exact normalized legal name always wins. With no exact match, a printed name that differs
   from one legal name only by a legal suffix on one side (`Acme Field Services` vs `Acme Field Services Inc.`) matches if it is
   unique across the whole vendor master and the remaining name has at least two words. Two candidates hold as
   `VENDOR_AMBIGUOUS`; different suffixes (`… LLC` vs `… Inc`) never match. The method and compared forms are stored.
 - **Description-only lines.** A line with no printed SKU keeps its SKU null. On a printed PO, it maps to the one PO
-  line whose description shares at least two and at least 60% of its meaningful words (months, years and numbers
-  ignored); none or several qualifying lines hold as `LINE_NOT_ON_PO`. The resolved PO line, shared words and CSV
-  row are stored, and price, quantity and authorization checks apply as usual. Without a printed PO such a line is
-  never matched.
+  line whose identifying words all appear in the invoice description, with no contradicting qualifier. Generic
+  billing words (fee, monthly, services, retainer, ...), months and years never identify a line, and a PO line needs
+  at least two identifying words. Contradictions are a negated or prefixed form (`unmanaged` vs `managed`), a
+  negation word (`non`, `without`, `excluding`) or a different member of an exclusive group (monthly/annual,
+  onsite/remote, basic/standard/premium, primary/backup). None or several qualifying lines hold as
+  `LINE_NOT_ON_PO`, and the hold lists each PO line with its missing words and conflicts. The resolved PO line and
+  the comparison are stored, and price, quantity and authorization checks apply as usual. Without a printed PO such
+  a line is never matched.
 - **Tax wording and service period.** A tax cell printed as `Not applicable`, `N/A`, `Exempt` and similar reads
   as zero only when the printed subtotal equals the total; the words stay as the raw value and evidence. A printed
   `Service period` (`September 2026`, or an ISO date range) is extracted with evidence.
@@ -199,9 +205,11 @@ supplied sample. They cover:
 - a repeated SKU against a candidate PO, ineligible just like an explicit PO;
 - service invoices: tax wording with and without reconciling totals, service periods, legal-suffix vendor
   variants (unique, ambiguous, exact precedence, different suffix, inactive), description-only lines (unique,
-  ambiguous, no match, price and quantity still checked, no printed PO, unclear description), a next-month charge
-  with the same amount, a resent copy with leading zeros (blocked when corroborated, held when re-dated, normal
-  checks without period corroboration), and the existing exact-number block;
+  reworded, ambiguous, no match, a conflicting qualifier such as unmanaged vs managed, annual vs monthly, negation,
+  generic-only PO wording, price and quantity still checked, no printed PO, unclear description), a next-month
+  charge with the same amount, a resent copy with leading zeros (blocked when corroborated, held when re-dated or
+  when either service period is read below confidence 80, normal checks without period corroboration), and the
+  existing exact-number block;
 - layout variants: `Invoice #:` and `Customer PO:` style labels, right-aligned figures under left-aligned headers,
   numbers inside descriptions, a missing or doubled quantity (held), and a two-shipment PO where the second
   shipment is held for exceeding one SKU's quantity and the PO total;
