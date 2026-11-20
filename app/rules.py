@@ -17,7 +17,7 @@ Priority order (first failing rule decides):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import ROUND_DOWN, ROUND_HALF_UP, ROUND_UP, Decimal
 from typing import Any, Optional
 
 from .models import Decision, ExtractedInvoice, Field_
@@ -363,7 +363,7 @@ def _candidate_evidence(inv: ExtractedInvoice, snap: Snapshot, po: dict[str, Any
         amount_ok = line.amount.value <= b["remaining_net_cents"]
         row.update(po_line_id=pl["line_id"], source=f"{pl['source_file']} row {pl['source_row']}", sku_ok=True,
                    po_unit_price=pl["unit_price"],
-                   variance_pct=f"{(variance / po_rate * 100) if po_rate else Decimal(0):.2f}", price_ok=price_ok,
+                   variance_pct=f"{_pct_figure(variance, po_rate):f}", price_ok=price_ok,
                    authorized_quantity=b["authorized_quantity"], allocated_quantity=b["allocated_quantity"],
                    remaining_quantity=b["remaining_quantity"], quantity_ok=qty_ok,
                    remaining_net_cents=b["remaining_net_cents"], amount_ok=amount_ok)
@@ -509,8 +509,33 @@ def _line_mapping(inv, snap: Snapshot, po, check) -> list[tuple[Any, dict[str, A
     return mapping
 
 
-def _signed_pct(value: Decimal) -> str:
-    return f"{'+' if value > 0 else ''}{value:.2f}%"
+_MAX_PCT_PLACES = 6
+
+
+def _pct_figure(delta: Decimal, po_rate: Decimal, places: int = 2) -> Decimal:
+    """Variance of `delta` against `po_rate` in percent, rounded for display only.
+
+    Starts at `places` decimals and adds more until the figure sits on the same side of the tolerance
+    limit as the exact values (above, at, or within), so +1.001% never reads as "+1.00%" and +0.9999%
+    never reads as "+1.00%" either. The side comes from the same exact Decimal comparison the price
+    check uses; the rounded figure never decides anything."""
+    if not po_rate:
+        return Decimal(0).quantize(Decimal(1).scaleb(-places))
+    limit_amount = po_rate * PRICE_TOLERANCE
+    side = (abs(delta) > limit_amount) - (abs(delta) < limit_amount)
+    pct, limit_pct = delta / po_rate * 100, PRICE_TOLERANCE * 100
+    for p in range(places, max(places, _MAX_PCT_PLACES) + 1):
+        q = pct.quantize(Decimal(1).scaleb(-p), rounding=ROUND_HALF_UP)
+        if (abs(q) > limit_pct) - (abs(q) < limit_pct) == side:
+            break
+    else:  # still level with the limit after rounding: round away from it, towards the exact side
+        q = pct.quantize(Decimal(1).scaleb(-p), rounding=ROUND_UP if side > 0 else ROUND_DOWN)
+    return abs(q) if q == 0 else q  # no "-0.00"
+
+
+def _signed_pct(delta: Decimal, po_rate: Decimal) -> str:
+    q = _pct_figure(delta, po_rate)
+    return f"{'+' if q > 0 else ''}{q:f}%"
 
 
 def _fmt_rate(rate: str, cur: str) -> str:
@@ -536,13 +561,13 @@ def _price(inv, po, mapping, check, ctx) -> None:
         inv_rate, po_rate = Decimal(line.unit_price.value), Decimal(pl["unit_price"])
         delta = inv_rate - po_rate
         ok = abs(delta) <= po_rate * PRICE_TOLERANCE
-        pct = (delta / po_rate * 100) if po_rate else Decimal(0)
         at_po_price = decimal_to_cents(qty * po_rate)
         diff_cents = line.amount.value - at_po_price
         ev = line.unit_price.evidence
         row = {"line": line.row_index + 1, "sku": line.sku.value, "po_id": po["po_id"], "po_line_id": pl["line_id"],
                "quantity": norm_decimal(qty), "invoice_unit_price": norm_decimal(inv_rate),
-               "po_unit_price": norm_decimal(po_rate), "variance_pct": f"{pct:.4f}", "variance_display": _signed_pct(pct),
+               "po_unit_price": norm_decimal(po_rate), "variance_pct": f"{_pct_figure(delta, po_rate, 4):f}",
+               "variance_display": _signed_pct(delta, po_rate),
                "invoice_amount_cents": line.amount.value, "amount_at_po_price_cents": at_po_price,
                "amount_difference_cents": diff_cents, "within_tolerance": ok,
                "invoice_evidence": ev.model_dump() if ev is not None else None,

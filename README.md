@@ -120,7 +120,9 @@ upload ─► persist PDF + run (QUEUED) ─► worker claims run
   be within **1% (inclusive)** of its PO line price. If any line fails, the run is `HOLD / PRICE_VARIANCE` with
   zero allocations. Each line records the invoice and PO prices, the signed variance (for example `+5.00%`,
   `-7.50%`), the signed pre-tax amount difference at the invoiced quantity, the invoice page evidence and the PO
-  line's CSV row. The decision also records the subtotal at invoice prices against the subtotal at PO prices. When
+  line's CSV row. Percentages are shown to two decimals, with more added near the limit so the figure stays on the
+  same side of 1% as the exact comparison (`+1.001%` is held, `+0.9999%` passes, exactly `+1.00%` passes); the
+  display never decides anything. The decision also records the subtotal at invoice prices against the subtotal at PO prices. When
   line differences cancel out, the hold says so explicitly. Tax is reported separately; authorization and
   allocations stay pre-tax. The next action names each affected line and its PO price.
 - **Candidate line mapping** uses the same rule as an explicit PO: each invoice line needs its own PO line. A
@@ -164,7 +166,9 @@ supplied sample. They cover:
 - OCR near matches: a scan whose look-alike number corroborates a copy (held), and a scan with a distinct number,
   later date and new amounts (accepted);
 - unit prices: offsetting differences with an unchanged subtotal and separate tax (both lines reported, over HTTP
-  too), exactly +1% and -1% accepted, +1.01% and -1.01% held, and a single failing line among passing ones;
+  too), exactly +1% and -1% accepted, +1.01% and -1.01% held, a single failing line among passing ones, and
+  near-limit variances that round to 1.00% (`+1.001%`/`-1.001%` held and displayed as such, `+0.9999%` accepted)
+  in the reason, check detail, candidate table and over HTTP;
 - a repeated SKU against a candidate PO, ineligible just like an explicit PO;
 - OCR on a rotated, image-only scan. The scan is drawn with the font bundled in Pillow (pinned), not rendered
   from a non-embedded-font PDF, so the test input is the same on every host. Rendering through Poppler depended

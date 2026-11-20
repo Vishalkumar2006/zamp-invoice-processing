@@ -69,9 +69,50 @@ def test_inclusive_one_percent_boundary_in_both_directions(rate, amount, ok):
     assert (d.decision == "READY") is ok, (rate, d.reason_code)
     row = d.price_check["lines"][0]
     assert row["within_tolerance"] is ok
+    assert row["variance_display"] == {"101": "+1.00%", "99": "-1.00%", "101.01": "+1.01%", "98.99": "-1.01%"}[rate]
     if not ok:
         assert d.reason_code == "PRICE_VARIANCE" and d.price_check["failed_lines"] == [1]
-        assert row["variance_display"] == ("+1.01%" if rate == "101.01" else "-1.01%")
+
+
+def _one_line_off(rate):
+    from app.money import decimal_to_cents
+    from decimal import Decimal
+    amount = decimal_to_cents(Decimal(10) * Decimal(rate))
+    inv = invoice(net=f(amount + 50000), tax=f(0), gross=f(amount + 50000),
+                  lines=[line("AAA", "10", rate, amount, idx=0), line("BBB", "10", "50", 50000, idx=1)])
+    return evaluate(inv, two_line_snapshot(price_a="100", price_b="50"), min_conf=80, policy_version=POLICY)
+
+
+@pytest.mark.parametrize("rate,ok,display,stored", [
+    # All of these round to 1.00% at two decimals; the display must keep them on the right side of the limit.
+    ("101.001", False, "+1.001%", "1.0010"),          # just over +1%: held
+    ("98.999", False, "-1.001%", "-1.0010"),          # just over -1%: held
+    ("101.004", False, "+1.004%", "1.0040"),          # would round down to "+1.00%"
+    ("100.9999", True, "+0.9999%", "0.9999"),         # just within +1%: passes, must not read as the limit
+    ("99.0001", True, "-0.9999%", "-0.9999"),         # just within -1%: passes
+    ("101.00000001", False, "+1.000001%", "1.000001"),  # beyond six places: rounded away from the limit
+])
+def test_near_limit_variance_is_shown_on_the_correct_side_of_one_percent(rate, ok, display, stored):
+    d = _one_line_off(rate)
+    row = d.price_check["lines"][0]
+    assert row["within_tolerance"] is ok and (d.decision == "READY") is ok, (rate, d.reason_code)
+    assert row["variance_display"] == display and row["variance_pct"] == stored
+    price_checks = [c for c in d.checks if c["rule"] == "price"]
+    assert f"({display}, limit 1%)" in price_checks[0]["detail"]
+    if not ok:
+        assert d.reason_code == "PRICE_VARIANCE" and d.allocation is None
+        assert f"vs PO USD 100.00 ({display}, " in d.reason and "1.00%" not in d.reason
+    else:
+        assert d.allocation is not None
+
+
+def test_candidate_table_shows_near_limit_variance_with_enough_precision():
+    inv = invoice(po_reference=Field_(), net=f(151502), gross=f(151502),
+                  lines=[line("FLT", "12", "126.25125", 151502, idx=0)])  # +1.001% on 125
+    d = evaluate(inv, _flt_snapshot(), min_conf=80, policy_version=POLICY)
+    assert d.reason_code == "PO_MISSING_NO_MATCH" and d.allocation is None
+    cand_line = d.po_candidates["candidates"][0]["lines"][0]
+    assert cand_line["price_ok"] is False and cand_line["variance_pct"] == "1.001"
 
 
 def test_single_failed_line_is_named_and_others_pass():
@@ -149,3 +190,20 @@ def test_offsetting_prices_over_http_with_separate_tax(client):
     assert client.post(f"/runs/{run_id}/finalize").json()["allocations_for_run"] == 0
     assert client.get("/ledger").json() == before
     assert client.get(f"/ui/runs/{run_id}").status_code == 200
+
+
+def test_near_limit_variance_over_http_is_not_shown_as_one_percent(client):
+    from tests.pdfgen import invoice_pdf
+    r = client.post("/procurement/import", files={"vendors": ("vendors.csv", VENDORS),
+                                                  "purchase_orders": ("purchase_orders.csv", POS),
+                                                  "po_lines": ("po_lines.csv", LINES)})
+    assert r.status_code == 201
+    # CAL-STD at 252.5025 = +1.001% on 250.00 (12 x 252.5025 = 3,030.03); CAL-TRV at the PO price.
+    pdf = invoice_pdf(po="PO-8801", lines=(("CAL-STD", "Standard calibration", "12", "$252.5025", "$3,030.03"),
+                                           ("CAL-TRV", "Technician travel", "1", "$480.00", "$480.00")),
+                      subtotal="$3,510.03", tax="$0.00", total="$3,510.03")
+    run = wait_for(client, client.post("/runs", files={"file": ("inv.pdf", pdf, "application/pdf")}).json()["run_id"])
+    assert run["decision"] == "HOLD" and run["reason_code"] == "PRICE_VARIANCE" and run["allocation_id"] is None
+    std = run["decision_detail"]["price_check"]["lines"][0]
+    assert (std["within_tolerance"], std["variance_display"], std["variance_pct"]) == (False, "+1.001%", "1.0010")
+    assert "(+1.001%, +USD 30.03 at 12 units)" in run["reason"]
