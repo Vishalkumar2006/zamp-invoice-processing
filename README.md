@@ -33,10 +33,12 @@ To require HTTP basic auth, set `APP_PASSWORD` (and optionally `APP_USERNAME`, d
 In the UI:
 
 1. **Upload**: import `vendors.csv`, `purchase_orders.csv` and `po_lines.csv` into a fresh workspace.
-2. Upload an invoice PDF. You land on the live run view, which shows stages from persisted events, the
+2. Upload an invoice PDF. The upload goes to the workspace named on the page, even if another tab has imported a
+   newer one since. You land on the live run view, which shows stages from persisted events, the
    decision, the next action, the PO balance before and after, every extracted field with its page, method
    (`native`/`ocr`), confidence and position, every rule check, and the original PDF side by side.
-3. **History** lists runs, outcomes and the PO ledger.
+3. **History** lists runs, outcome counts and the PO ledger for one workspace, picked from a selector (default:
+   the latest; the choice stays in the URL). Each run page links to the history of its own workspace.
 
 The same flow over HTTP:
 
@@ -55,13 +57,13 @@ curl http://localhost:8000/ledger                                             # 
 | GET | `/health` | DB and OCR tool check |
 | POST | `/procurement/import` | Three CSVs, validated together. Creates a new workspace, or returns 422 with every error. |
 | GET | `/procurement` | Imported rows with their source file and row |
-| POST | `/runs` | PDF upload. Stores the file and queues the run, then returns `202` with `run_id`. |
-| GET | `/runs` | Run history |
+| POST | `/runs` | PDF upload. Stores the file and queues the run, then returns `202` with `run_id` and `workspace_id`. Optional form field `workspace_id` (the UI always sends it); omitted means the latest workspace; an unknown ID returns 422 and writes nothing. |
+| GET | `/runs` | Run history (`?workspace_id=` to scope) |
 | GET | `/runs/{id}` | Events, extraction plus evidence, decision, allocation, current PO balance, timings |
 | GET | `/runs/{id}/pdf` | The original uploaded PDF |
 | POST | `/runs/{id}/finalize` | Retries finalization from the stored extraction. Idempotent: never a second allocation. |
 | POST | `/runs/{id}/retry` | Re-queues a `FAILED` run |
-| GET | `/ledger` | Read-only ledger: authorized, allocated and remaining net and quantity per PO and line, plus allocations |
+| GET | `/ledger` | Read-only ledger (`?workspace_id=`, default latest): authorized, allocated and remaining net and quantity per PO and line, plus allocations |
 
 ## How it works
 
@@ -171,6 +173,9 @@ supplied sample. They cover:
   near-limit variances that round to 1.00% (`+1.001%`/`-1.001%` held and displayed as such, `+0.9999%` accepted)
   in the reason, check detail, candidate table and over HTTP;
 - a repeated SKU against a candidate PO, ineligible just like an explicit PO;
+- workspace routing: an upload from a page loaded before a newer import still lands in the page's workspace, an API
+  upload without `workspace_id` uses the latest, an unknown ID is rejected with nothing written, and history (run
+  list, counts, ledger) is scoped to the selected workspace;
 - OCR on a rotated, image-only scan. The scan is drawn with the font bundled in Pillow (pinned), not rendered
   from a non-embedded-font PDF, so the test input is the same on every host. Rendering through Poppler depended
   on host fonts: with none installed, Poppler 26 produced a blank page.
@@ -181,6 +186,7 @@ supplied sample. They cover:
 - An invoice with no printed PO goes to `HOLD` with candidate POs. It is never auto-allocated.
 - If no ISO code is printed, a `$` sign is read as USD. The note is kept on the currency field.
 - A held or blocked run contributes zero to PO balances.
-- Each CSV import creates a new workspace, and new runs go to the latest workspace. This isolates test scenarios.
+- Each CSV import creates a new workspace. This isolates test scenarios. Browser uploads go to the workspace shown
+  on the upload page; API uploads without `workspace_id` go to the latest workspace.
 - Not yet built: reviewer confirmation and re-check of held invoices, overlay of evidence boxes on the PDF,
   deployment, and the remaining exception scenarios planned for the next milestone.

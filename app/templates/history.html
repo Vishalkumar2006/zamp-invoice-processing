@@ -2,7 +2,22 @@
 {% block title %}History{% endblock %}
 {% block content %}
 <section class="card">
-  <h2>Run history</h2>
+  <h2>Run history{% if workspace_id %} <span class="muted">· workspace <code id="current-ws">{{ workspace_id }}</code>
+    {%- if workspace_id == latest_workspace_id %} (latest){% endif %}</span>{% endif %}</h2>
+  {% if workspaces %}
+  <form id="ws-form" class="wsform" method="get" action="/ui/history">
+    <label>Workspace
+      <select name="workspace_id" id="ws-select" onchange="this.form.submit()">
+        {% for w in workspaces %}
+        <option value="{{ w.workspace_id }}" {% if w.workspace_id == workspace_id %}selected{% endif %}>
+          {{ w.workspace_id }} · imported {{ w.created_at[:16].replace('T', ' ') }} UTC · {{ w.runs }} run{{ '' if w.runs == 1 else 's' }}{% if loop.first %} · latest{% endif %}
+        </option>
+        {% endfor %}
+      </select>
+    </label>
+    <noscript><button type="submit">Show</button></noscript>
+  </form>
+  {% endif %}
   <p class="counts">{% for k, v in counts.items() %}<span class="pill {{ k|lower }}">{{ k }} {{ v }}</span> {% endfor %}</p>
   <div class="tablewrap"><table>
     <thead><tr><th>Submitted</th><th>Vendor</th><th>Invoice</th><th>Date</th><th class="num">Amount</th><th>PO</th><th>Status</th><th>Decision</th><th>Reason</th><th class="num">Time</th></tr></thead>
@@ -21,7 +36,7 @@
         <td class="num">{{ '%.1f s'|format(r.processing_ms/1000) if r.processing_ms is not none else '' }}</td>
       </tr>
     {% else %}
-      <tr><td colspan="10" class="muted">No runs yet.</td></tr>
+      <tr><td colspan="10" class="muted">No runs in this workspace yet.</td></tr>
     {% endfor %}
     </tbody>
   </table></div>

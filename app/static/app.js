@@ -41,7 +41,7 @@ function initHome() {
     const t0 = performance.now();
     const { res, body } = await postForm("/runs", up);
     if (res.status === 202) {
-      out.textContent = `Accepted in ${Math.round(performance.now() - t0)} ms → ${body.run_id}`;
+      out.textContent = `Accepted in ${Math.round(performance.now() - t0)} ms → ${body.run_id} (workspace ${body.workspace_id})`;
       location.href = body.links.ui;
     } else {
       out.className = "result err";
@@ -53,7 +53,10 @@ function initHome() {
 
 async function loadRecent() {
   const el = document.getElementById("recent");
-  const data = await (await fetch("/runs?limit=10")).json();
+  // Same workspace the upload form is bound to (none before the first import).
+  const wsField = document.querySelector("#upload-form input[name=workspace_id]");
+  const scope = wsField ? `&workspace_id=${encodeURIComponent(wsField.value)}` : "";
+  const data = await (await fetch(`/runs?limit=10${scope}`)).json();
   if (!data.runs.length) { el.innerHTML = '<p class="muted">No runs yet.</p>'; return; }
   const rows = data.runs.map((r) => `<tr><td><a href="/ui/runs/${esc(r.run_id)}">${esc(r.run_id)}</a></td>
     <td>${esc(r.filename)}</td><td>${esc(r.invoice_number || "—")}</td><td class="num">${money(r.gross_cents, r.currency)}</td>

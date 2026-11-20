@@ -69,3 +69,6 @@ tr.fail td strong { color: var(--blocked); }
 table.cands th { vertical-align: top; }
 table.cands td.bad { background: var(--hold-bg); }
 table.cands th.fit { color: var(--ready); }
+.wslink { margin-left: auto; font-size: 13px; }
+.wsform { margin: 4px 0 10px; }
+.wsform select { margin-left: 6px; max-width: 100%; padding: 4px 6px; font: inherit; }

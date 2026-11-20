@@ -19,6 +19,10 @@
   <div class="card">
     <h2>2. Submit an invoice PDF</h2>
     <form id="upload-form">
+      {% if ws %}
+      <input type="hidden" name="workspace_id" value="{{ ws.workspace_id }}">
+      <p class="muted">Uploads from this page go to workspace <code>{{ ws.workspace_id }}</code>.</p>
+      {% endif %}
       <label>Invoice PDF <input type="file" name="file" accept="application/pdf,.pdf" required></label>
       <button type="submit" {% if not ws %}disabled{% endif %}>Upload and process</button>
     </form>
@@ -26,7 +30,8 @@
   </div>
 </section>
 <section class="card">
-  <h2>Recent runs</h2>
+  <h2>Recent runs{% if ws %} <span class="muted">(workspace {{ ws.workspace_id }} ·
+    <a href="/ui/history?workspace_id={{ ws.workspace_id|urlencode }}">history and ledger</a>)</span>{% endif %}</h2>
   <div id="recent">Loading…</div>
 </section>
 {% endblock %}

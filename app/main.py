@@ -11,9 +11,10 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -93,6 +94,34 @@ def _run_summary(r) -> dict[str, Any]:
     }
 
 
+def _workspace_exists(conn, workspace_id: str) -> bool:
+    return conn.execute("SELECT 1 FROM workspaces WHERE id=?", (workspace_id,)).fetchone() is not None
+
+
+def _runs_in(conn, workspace_id: Optional[str], limit: int) -> list[dict[str, Any]]:
+    """Newest runs first, optionally scoped to one workspace (shared by the API and the history page)."""
+    q = "SELECT * FROM runs" + (" WHERE workspace_id=?" if workspace_id else "") + " ORDER BY created_at DESC LIMIT ?"
+    args = (workspace_id, limit) if workspace_id else (limit,)
+    return [_run_summary(r) for r in conn.execute(q, args)]
+
+
+_COUNT_ORDER = ("READY", "HOLD", "BLOCKED", "FAILED", "RUNNING", "QUEUED")
+
+
+def _outcome_counts(conn, workspace_id: str) -> dict[str, int]:
+    """Decision (or run status while undecided) counts over every run in the workspace."""
+    rows = conn.execute("SELECT COALESCE(decision, status) AS k, COUNT(*) AS n FROM runs WHERE workspace_id=?"
+                        " GROUP BY k", (workspace_id,)).fetchall()
+    found = {r["k"]: r["n"] for r in rows}
+    return {k: found[k] for k in sorted(found, key=lambda k: (_COUNT_ORDER.index(k) if k in _COUNT_ORDER else 99, k))}
+
+
+def _workspaces(conn) -> list[dict[str, Any]]:
+    rows = conn.execute("SELECT w.id, w.created_at, (SELECT COUNT(*) FROM runs r WHERE r.workspace_id=w.id) AS runs"
+                        " FROM workspaces w ORDER BY w.created_at DESC, w.rowid DESC").fetchall()
+    return [{"workspace_id": r["id"], "created_at": r["created_at"], "runs": r["runs"]} for r in rows]
+
+
 def _run_detail(conn, run_id: str) -> dict[str, Any]:
     r = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
     if r is None:
@@ -167,9 +196,15 @@ async def create_run(file: UploadFile = File(...), workspace_id: Optional[str] =
     if not content.startswith(b"%PDF-"):
         raise HTTPException(415, "file is not a PDF")
     with db() as conn:
-        ws = workspace_id or latest_workspace_id(conn)
-        if not ws or conn.execute("SELECT 1 FROM workspaces WHERE id=?", (ws,)).fetchone() is None:
-            raise HTTPException(409, "import procurement CSVs before submitting invoices")
+        if workspace_id:  # explicit (the browser always sends the workspace shown on its page)
+            if not _workspace_exists(conn, workspace_id):
+                raise HTTPException(422, f"Workspace {workspace_id} does not exist. Nothing was uploaded or allocated. "
+                                         f"Reload the upload page to pick up a current workspace.")
+            ws = workspace_id
+        else:  # API callers that omit the field get the latest workspace
+            ws = latest_workspace_id(conn)
+            if not ws:
+                raise HTTPException(409, "import procurement CSVs before submitting invoices")
         run_id = "run_" + uuid.uuid4().hex[:12]
         path = config.UPLOAD_DIR / f"{run_id}.pdf"
         path.write_bytes(content)
@@ -192,9 +227,7 @@ async def create_run(file: UploadFile = File(...), workspace_id: Optional[str] =
 @app.get("/runs")
 def list_runs(workspace_id: Optional[str] = None, limit: int = 100) -> dict[str, Any]:
     with db() as conn:
-        q = "SELECT * FROM runs" + (" WHERE workspace_id=?" if workspace_id else "") + " ORDER BY created_at DESC LIMIT ?"
-        args = (workspace_id, limit) if workspace_id else (limit,)
-        return {"runs": [_run_summary(r) for r in conn.execute(q, args)]}
+        return {"runs": _runs_in(conn, workspace_id, limit)}
 
 
 @app.get("/runs/{run_id}")
@@ -275,19 +308,25 @@ def ui_home(request: Request):
 @app.get("/ui/runs/{run_id}", response_class=HTMLResponse)
 def ui_run(request: Request, run_id: str):
     with db() as conn:
-        if conn.execute("SELECT 1 FROM runs WHERE id=?", (run_id,)).fetchone() is None:
+        r = conn.execute("SELECT workspace_id FROM runs WHERE id=?", (run_id,)).fetchone()
+        if r is None:
             raise HTTPException(404, "run not found")
-    return templates.TemplateResponse(request, "run.html", {"run_id": run_id})
+    return templates.TemplateResponse(request, "run.html", {"run_id": run_id, "workspace_id": r["workspace_id"]})
 
 
 @app.get("/ui/history", response_class=HTMLResponse)
-def ui_history(request: Request):
+def ui_history(request: Request, workspace_id: Optional[str] = None):
+    """Run list, outcome counts and PO ledger, all for one workspace (default: the latest)."""
     with db() as conn:
-        runs = [_run_summary(r) for r in conn.execute("SELECT * FROM runs ORDER BY created_at DESC LIMIT 200")]
-        ws = latest_workspace_id(conn)
-        ledger_data = ledger_report(conn, ws) if ws else None
-    counts: dict[str, int] = {}
-    for r in runs:
-        k = r["decision"] or r["status"]
-        counts[k] = counts.get(k, 0) + 1
-    return templates.TemplateResponse(request, "history.html", {"runs": runs, "counts": counts, "ledger": ledger_data})
+        if not workspace_id:
+            latest = latest_workspace_id(conn)
+            if latest:  # pin the default in the URL so a refresh keeps showing the same workspace
+                return RedirectResponse(f"/ui/history?workspace_id={quote(latest)}", status_code=303)
+            return templates.TemplateResponse(request, "history.html", {
+                "workspace_id": None, "workspaces": [], "runs": [], "counts": {}, "ledger": None})
+        if not _workspace_exists(conn, workspace_id):
+            raise HTTPException(404, f"workspace {workspace_id} not found")
+        ctx = {"workspace_id": workspace_id, "workspaces": _workspaces(conn),
+               "latest_workspace_id": latest_workspace_id(conn), "runs": _runs_in(conn, workspace_id, 200),
+               "counts": _outcome_counts(conn, workspace_id), "ledger": ledger_report(conn, workspace_id)}
+    return templates.TemplateResponse(request, "history.html", ctx)
