@@ -24,7 +24,7 @@ from .extraction import tool_versions
 from .ledger import finalize, ledger_report, load_snapshot
 from .money import fmt_cents
 from .procurement import ImportError_, import_procurement
-from .remittance import redact_extraction, redact_vendor
+from .remittance import extraction_identifiers, redact_extraction, redact_identifiers, redact_vendor
 from .rules import po_balance
 from .worker import Worker, recover_interrupted
 
@@ -84,10 +84,17 @@ def _ms_between(a: Optional[str], b: Optional[str]) -> Optional[int]:
     return int((datetime.fromisoformat(b) - datetime.fromisoformat(a)).total_seconds() * 1000)
 
 
-def _run_summary(r) -> dict[str, Any]:
+def _run_identifiers(r) -> set[str]:
+    """Full routing/account numbers recognized in this run's extraction; masked wherever they appear in output."""
+    return extraction_identifiers(json.loads(r["extraction_json"]).get("invoice")) if r["extraction_json"] else set()
+
+
+def _run_summary(r, idents: Optional[set[str]] = None) -> dict[str, Any]:
+    idents = _run_identifiers(r) if idents is None else idents
     return {
-        "run_id": r["id"], "workspace_id": r["workspace_id"], "filename": r["filename"], "status": r["status"],
-        "decision": r["decision"], "reason_code": r["reason_code"], "reason": r["reason"],
+        "run_id": r["id"], "workspace_id": r["workspace_id"], "filename": redact_identifiers(r["filename"], idents),
+        "status": r["status"], "decision": r["decision"], "reason_code": r["reason_code"],
+        "reason": redact_identifiers(r["reason"], idents),
         "vendor_id": r["vendor_id"], "po_id": r["po_id"], "invoice_number": r["invoice_number"],
         "invoice_date": r["invoice_date"], "gross_cents": r["gross_cents"], "currency": r["currency"],
         "created_at": r["created_at"], "finished_at": r["finished_at"],
@@ -132,13 +139,17 @@ def _run_detail(conn, run_id: str) -> dict[str, Any]:
          "data": json.loads(e["data_json"]) if e["data_json"] else None}
         for e in conn.execute("SELECT * FROM run_events WHERE run_id=? ORDER BY id", (run_id,))
     ]
-    out = _run_summary(r)
+    idents = _run_identifiers(r)
+    out = _run_summary(r, idents)
+    # Field-aware redaction: identifiers recognized by extraction are masked in any grouping (contiguous,
+    # hyphenated, spaced) in event, extraction and decision text. The stored PDF stays the unredacted source.
     out.update({
-        "sha256": r["sha256"], "size_bytes": r["size_bytes"], "attempts": r["attempts"], "error": r["error"],
+        "sha256": r["sha256"], "size_bytes": r["size_bytes"], "attempts": r["attempts"],
+        "error": redact_identifiers(r["error"], idents),
         "started_at": r["started_at"], "decided_at": r["decided_at"], "policy_version": r["policy_version"],
-        "events": events,
+        "events": redact_identifiers(events, idents),
         "extraction": redact_extraction(json.loads(r["extraction_json"])) if r["extraction_json"] else None,
-        "decision_detail": json.loads(r["decision_json"]) if r["decision_json"] else None,
+        "decision_detail": redact_identifiers(json.loads(r["decision_json"]), idents) if r["decision_json"] else None,
         "pdf_url": f"/runs/{run_id}/pdf",
     })
     alloc = conn.execute("SELECT id, net_cents, po_id FROM allocations WHERE run_id=?", (run_id,)).fetchone()

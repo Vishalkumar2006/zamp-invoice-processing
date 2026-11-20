@@ -6,7 +6,8 @@ Priority order (first failing rule decides):
   1. evidence      critical fields present, unambiguous and above the confidence floor
   2. vendor        unique approved vendor by normalised legal name (exact first; else a unique
                    legal-suffix variant, e.g. printed "Acme Tools" for legal "Acme Tools Inc.")
-  2b. remittance   printed bank details vs the vendor master: a verified mismatch -> HOLD REMITTANCE_MISMATCH;
+  2b. remittance   printed bank details vs the vendor master: different clearly printed routing or account
+                   numbers -> HOLD REMITTANCE_CONFLICT; a verified mismatch -> HOLD REMITTANCE_MISMATCH;
                    an explicit change notice that cannot be fully verified -> HOLD REMITTANCE_CHANGE_UNVERIFIED.
                    The reviewer is pointed to the vendor master's verification phone, never the invoice's.
   3. duplicate     vendor + invoice number already accepted -> BLOCKED (corroborated copy) /
@@ -30,7 +31,7 @@ from typing import Any, Optional
 from .models import Decision, ExtractedInvoice, Field_
 from .money import decimal_to_cents, fmt_cents, norm_decimal
 from .procurement import norm_name
-from .remittance import compare_identifier, mask, redact_text
+from .remittance import compare_identifier, distinct_identifiers, extraction_identifiers, mask, redact_text
 
 PRICE_TOLERANCE = Decimal("0.01")  # 1%, inclusive
 SUPPORTED_CURRENCIES = {"USD"}
@@ -255,11 +256,27 @@ def _remittance(inv: ExtractedInvoice, vendor: dict[str, Any], min_conf: float, 
         check("remittance", True, "no payment instructions printed")
         return
     source = f"{vendor['source_file']} row {vendor['source_row']}"
+    idents = extraction_identifiers(inv)
+
+    def ev_rec(ev):
+        return {"page": ev.page, "method": ev.method, "label": ev.label, "bbox": ev.bbox, "conf": ev.conf,
+                "text": redact_text(ev.text, idents)} if ev else None
+
     rows = []
     for key, f in printed.items():
         ident = key != "bank_name"
         show = (lambda v: mask(v)) if ident else (lambda v: v)
-        if f.raw is None:
+        readings = inv.remit_readings.get("remit_" + key, []) if ident else []
+        # Several different numbers printed: only values read clearly (>= min_conf) can conflict. One clear value
+        # among unclear copies is compared as usual; unclear copies alone stay a low-confidence read.
+        clear = [r for r in readings if r.value and r.evidence and r.evidence.conf >= min_conf]
+        if readings and len(distinct_identifiers([r.value for r in clear])) == 1:
+            f = clear[0]
+        if len(distinct_identifiers([r.value for r in clear])) > 1:
+            status = "conflict"
+        elif readings and not clear:
+            status = "low_confidence"
+        elif f.raw is None:
             status = "not_printed"
         elif f.value is None:
             status = "unreadable"
@@ -271,22 +288,29 @@ def _remittance(inv: ExtractedInvoice, vendor: dict[str, Any], min_conf: float, 
             status = "not_on_file"
         else:
             status = "match" if norm_name(f.value) == norm_name(on_file[key]) else "mismatch"
-        ev = f.evidence
-        rows.append({"field": key, "label": _REMIT_LABELS[key], "status": status,
-                     "invoice": show(f.value or f.raw) if (f.value or f.raw) else None,
-                     "on_file": show(on_file[key]) if on_file[key] else None, "on_file_source": source,
-                     "invoice_evidence": {"page": ev.page, "method": ev.method, "label": ev.label, "bbox": ev.bbox,
-                                          "conf": ev.conf, "text": redact_text(ev.text)} if ev else None})
+        row = {"field": key, "label": _REMIT_LABELS[key], "status": status,
+               "invoice": show(f.value or f.raw) if (f.value or f.raw) else None,
+               "on_file": show(on_file[key]) if on_file[key] else None, "on_file_source": source,
+               "invoice_evidence": ev_rec(f.evidence)}
+        if readings:
+            row["readings"] = [{"invoice": mask(r.value or r.raw), "vs_file": compare_identifier(r.value, on_file[key]),
+                                "clear": r in clear, "invoice_evidence": ev_rec(r.evidence)} for r in readings]
+            if status == "conflict":
+                row["invoice"] = " / ".join(x["invoice"] for x in row["readings"] if x["clear"])
+        rows.append(row)
     phone = vendor.get("verification_phone")
     contact = {"phone": phone, "source": f"{source} (verification_phone)"} if phone else None
     notice_rec = None
     if notice.value is not None:
         nev = notice.evidence
-        notice_rec = {"text": redact_text(notice.raw), "phrase": notice.value,
+        notice_rec = {"text": redact_text(notice.raw, idents), "phrase": notice.value,
                       "evidence": {"page": nev.page, "method": nev.method, "bbox": nev.bbox, "conf": nev.conf} if nev else None}
     by = {r["field"]: r for r in rows}
     mismatches = [r for r in rows if r["status"] == "mismatch"]
-    if notice_rec is None:
+    conflicts = [r for r in rows if r["status"] == "conflict"]
+    if conflicts:
+        verdict = "conflict"
+    elif notice_rec is None:
         verdict = "mismatch" if mismatches else "consistent"
     else:
         account_ok = by["account"]["status"] == "match"
@@ -294,7 +318,8 @@ def _remittance(inv: ExtractedInvoice, vendor: dict[str, Any], min_conf: float, 
         verdict = "mismatch" if mismatches else ("notice_verified" if account_ok and routing_ok else "notice_unverified")
     ctx["remittance"] = {"comparison": rows, "change_notice": notice_rec, "verification_contact": contact,
                          "outcome": verdict, "vendor_id": vendor["vendor_id"], "min_conf": min_conf,
-                         "rule": "a verified mismatch holds; a change notice holds unless the printed account (and routing, "
+                         "rule": "different clearly printed routing or account numbers hold for review; a verified "
+                                 "mismatch holds; a change notice holds unless the printed account (and routing, "
                                  "if printed) fully matches the vendor master; the vendor master is never updated from an invoice"}
     summary = "; ".join(f"{r['label']} {r['invoice'] or '-'} vs {r['on_file'] or 'none on file'}: {r['status']}" for r in rows)
     if verdict in ("consistent", "notice_verified"):
@@ -302,17 +327,34 @@ def _remittance(inv: ExtractedInvoice, vendor: dict[str, Any], min_conf: float, 
         return
 
     who = vendor["legal_name"]
+    purpose = ("which of the printed accounts, if any, is genuine" if verdict == "conflict"
+               else "whether the remittance change is genuine")
     if contact:
         action = (f"Do not pay, and do not change {who}'s bank details from this invoice. Call {who} on the verification "
-                  f"phone in the vendor master, {phone} ({source}), to confirm whether the remittance change is genuine. "
+                  f"phone in the vendor master, {phone} ({source}), to confirm {purpose}. "
                   f"Do not use any phone number or email printed on the invoice. Only procurement updates the vendor "
                   f"master, after verification; then re-submit.")
     else:
         action = (f"Do not pay, and do not change {who}'s bank details from this invoice. The vendor master has no "
                   f"verification phone for {who} ({source}): ask procurement for a trusted contact, not one printed on "
-                  f"the invoice, and confirm the remittance change before any payment.")
+                  f"the invoice, and confirm {purpose} before any payment.")
     notice_txt = (f" The invoice also carries a change notice (\"{notice_rec['text']}\", page "
-                  f"{(notice_rec['evidence'] or {}).get('page')})." if notice_rec and verdict == "mismatch" else "")
+                  f"{(notice_rec['evidence'] or {}).get('page')})." if notice_rec and verdict in ("mismatch", "conflict") else "")
+    if verdict == "conflict":
+        def listing(r):
+            return ", ".join(f"{x['invoice']} (page {(x['invoice_evidence'] or {}).get('page')}; "
+                             f"{x['vs_file'].replace('_', ' ')} against the vendor master)" for x in r["readings"] if x["clear"])
+        diff = "; ".join(f"{len([x for x in r['readings'] if x['clear']])} different {r['label']}s: {listing(r)}"
+                         for r in conflicts)
+        if mismatches:
+            ctx["reason_codes"] = ["REMITTANCE_CONFLICT", "REMITTANCE_MISMATCH"]
+        check("remittance", False, f"payment instructions print conflicting identifiers: {summary}", source=source)
+        raise _Stop("HOLD", "REMITTANCE_CONFLICT",
+                    f"Invoice {inv.invoice_number.value} prints conflicting payment instructions for {who} "
+                    f"({vendor['vendor_id']}): {diff}. Vendor master on file ({source}): "
+                    + "; ".join(f"{r['label']} {r['on_file'] or 'none on file'}" for r in conflicts)
+                    + f".{notice_txt} Payment cannot be routed until the right account is confirmed; bank details are "
+                      f"never taken from an invoice.", action, review_field="remittance")
     if verdict == "mismatch":
         diff = "; ".join(f"{r['label']} {r['invoice']} on the invoice vs {r['on_file']} on file" for r in mismatches)
         check("remittance", False, f"printed remittance differs from the vendor master: {summary}", source=source)

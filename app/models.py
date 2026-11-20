@@ -84,6 +84,9 @@ class ExtractedInvoice(BaseModel):
     remit_bank_name: Field_ = Field(default_factory=Field_)
     remit_routing: Field_ = Field(default_factory=Field_)
     remit_account: Field_ = Field(default_factory=Field_)
+    # Every distinct printed value, with its own evidence, when payment instructions print more than one different
+    # routing or account number ("remit_routing" / "remit_account" keys). The field itself then has no value.
+    remit_readings: dict[str, list[Field_]] = Field(default_factory=dict)
     # An explicit notice that remittance details changed ("updated remittance details", "we have moved our banking").
     remittance_notice: Field_ = Field(default_factory=Field_)
     currency: Field_ = Field(default_factory=Field_)

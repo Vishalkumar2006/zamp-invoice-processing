@@ -141,14 +141,20 @@ upload ─► persist PDF + run (QUEUED) ─► worker claims run
   vendor, PO and amount alone never make a duplicate.
 - **Remittance safeguard.** Printed payment instructions (bank name, routing and account numbers, with page and
   position) and explicit change notices ("updated remittance details", "we have moved our banking") are compared
-  with the trusted bank data in the vendor master, right after the vendor is resolved. A verified mismatch
+  with the trusted bank data in the vendor master, right after the vendor is resolved. Two or more different
+  routing or account numbers printed clearly (confidence 80 or above) are `HOLD / REMITTANCE_CONFLICT`, with each
+  masked value, its page and its result against the vendor master. The same number printed in another format
+  (grouped, contiguous or masked) counts once, and one clear value among unclear copies is compared as usual. A verified mismatch
   (read at confidence 80 or above, value on file) is `HOLD / REMITTANCE_MISMATCH`. A change notice holds as
   `HOLD / REMITTANCE_CHANGE_UNVERIFIED` unless the printed account (and routing, if printed) fully matches the
   vendor master. Ordinary instructions, including an unchanged masked account reference (`****1234`), keep the
   normal workflow. The next action sends the reviewer to the vendor master's verification phone, or to procurement
   for a trusted contact when none is on file, never to contact details printed on the invoice. Invoices never
-  change the vendor master. Full routing and account numbers stay in the database only; decisions, the API and the
-  UI show masked values (last four digits) with source references.
+  change the vendor master. Full routing and account numbers stay in the database (and the uploaded PDF) only;
+  decisions, the API and the UI show masked values (last four digits) with source references. Masking is
+  field-aware: every routing or account number the extraction recognized is masked wherever it appears in a run
+  response (raw fields, evidence text, notices, comparison rows, reasons, events), whether printed contiguous,
+  hyphenated or space-separated. Other grouped numbers, such as phone numbers and dates, stay readable.
 - **Vendor names.** The exact normalized legal name always wins. With no exact match, a printed name that differs
   from one legal name only by a legal suffix on one side (`Acme Field Services` vs `Acme Field Services Inc.`) matches if it is
   unique across the whole vendor master and the remaining name has at least two words. Two candidates hold as
@@ -224,7 +230,10 @@ supplied sample. They cover:
   identifiers, migration of an existing database), extraction of payment instructions and change notices, a paired
   invoice with identical figures that holds with changed bank details and is `READY` with matching ones, a change
   notice without verifiable details, no verification phone (procurement), no instructions or no bank data on file
-  (normal workflow), and masked identifiers throughout the decision and the API;
+  (normal workflow), and masked identifiers throughout the decision and the API; two different accounts printed
+  without a notice (`REMITTANCE_CONFLICT`, ledger and vendor master unchanged), the same account in three formats
+  (`READY`), one clear reading among unclear copies, and contiguous, hyphenated and space-separated identifiers
+  masked across the whole run response;
 - a Case-3-style layout: an `INVOICE <id>` heading, `Merchandise` subtotal, `Ext.` amount column and an unlabelled
   `Ln` column that no longer merges into the part number;
 - layout variants: `Invoice #:` and `Customer PO:` style labels, right-aligned figures under left-aligned headers,

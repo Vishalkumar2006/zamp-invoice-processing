@@ -271,7 +271,11 @@ function renderRemittance(d) {
   const rows = r.comparison.map((c) => `<tr><td>${esc(c.label)}</td><td>${esc(c.invoice || "—")}</td>
     <td>${esc(c.on_file || "none on file")}</td><td>${esc(c.status)}</td>
     <td class="muted">${c.invoice_evidence ? `invoice p${esc(c.invoice_evidence.page)} · ${esc(c.invoice_evidence.method)}
-      · conf ${esc(c.invoice_evidence.conf)}` : "—"} / ${esc(c.on_file_source)}</td></tr>`).join("");
+      · conf ${esc(c.invoice_evidence.conf)}` : "—"} / ${esc(c.on_file_source)}</td></tr>`
+    + (c.readings || []).map((x) => `<tr class="${c.status === "conflict" && x.clear ? "fail" : ""}"><td class="muted">↳ printed</td>
+      <td>${esc(x.invoice)}</td><td></td><td>${esc(x.vs_file)}${x.clear ? "" : " (unclear read)"}</td>
+      <td class="muted">${x.invoice_evidence ? `invoice p${esc(x.invoice_evidence.page)} · ${esc(x.invoice_evidence.method)}
+        · conf ${esc(x.invoice_evidence.conf)} · “${esc(x.invoice_evidence.text)}”` : "—"}</td></tr>`).join("")).join("");
   const n = r.change_notice;
   const contact = r.verification_contact
     ? `Verify by phone with the number in the vendor master: <strong>${esc(r.verification_contact.phone)}</strong>

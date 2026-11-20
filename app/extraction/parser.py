@@ -16,7 +16,7 @@ from typing import Callable, Iterable, Optional
 
 from ..models import Evidence, ExtractedInvoice, Field_, LineItem, Token
 from ..money import norm_decimal, parse_decimal_amount, parse_money_cents, parse_quantity
-from ..remittance import digits as _digits
+from ..remittance import digits as _digits, is_masked, same_identifier
 
 
 # ----------------------------------------------------------------------------- geometry
@@ -229,10 +229,12 @@ _NO_TAX = re.compile(r"^(not applicable|n/?a|none|nil|exempt|tax exempt|not taxa
 
 
 # Payment-instruction phrases. Only rows that carry a routing or account number are read as remittance details.
+# An identifier printed contiguous ("000123456789"), hyphen- or space-grouped ("0001-2345-6789", "0001 2345 6789").
+_GROUPED_ID = r"[0-9*xX•]{2,6}(?:[ \-][0-9*xX•]{2,6}){1,5}"
 _ROUTING_RE = re.compile(r"\b(?:ach\s+|aba\s+|wire\s+)?(?:routing|aba|rtn)(?:\s*(?:no\.?|number|#))?\s*[:#]?\s*"
-                         r"([0-9*xX•]{4,12})(?![0-9])", re.IGNORECASE)
+                         rf"({_GROUPED_ID}|[0-9*xX•]{{4,12}})(?![0-9])", re.IGNORECASE)
 _ACCOUNT_RE = re.compile(r"\b(?:account|acct\.?|a/c)(?:\s*(?:no\.?|number|#))?\s*[:#]?\s*"
-                         r"([0-9*xX•][0-9*xX•-]{3,24})(?![0-9])", re.IGNORECASE)
+                         rf"({_GROUPED_ID}|[0-9*xX•][0-9*xX•-]{{3,24}})(?![0-9])", re.IGNORECASE)
 _BANK_WORD = re.compile(r"\b(bank|credit union|savings|bancorp)\b", re.IGNORECASE)
 _PART_SEP = re.compile(r"\s*[·•|;,]\s*|\s+[-–—]\s+")
 # Explicit notices that the remittance details changed. Ordinary "Remit to:" / "Pay by ACH:" lines are not notices.
@@ -414,19 +416,25 @@ class InvoiceParser:
     def _remittance(self) -> None:
         """Printed payment instructions (bank name, routing and account numbers) and any explicit change notice,
         each with its page and position. Informational for extraction: never blocks it; the rules compare the
-        values with the vendor master. Conflicting values across rows leave the field empty with a note."""
+        values with the vendor master. Different values across rows leave the field empty with a note, and each
+        distinct value is kept with its own evidence in `remit_readings`; one identifier printed in two formats
+        (grouped vs contiguous, masked vs full) counts once."""
         found: dict[str, list[tuple[str, list[Token]]]] = {"remit_bank_name": [], "remit_routing": [], "remit_account": []}
         for row in self.rows:
             text = " ".join(t.text for t in row.tokens)
+            starts, pos = [], 0
+            for t in row.tokens:
+                starts.append(pos)
+                pos += len(t.text) + 1
             hits = []
             for key, rx in (("remit_routing", _ROUTING_RE), ("remit_account", _ACCOUNT_RE)):
                 for m in rx.finditer(text):
                     value = re.sub(r"[-\s]", "", m.group(1))
                     if len(_digits(value)) < 4:
                         continue
-                    tail = _digits(value)[-4:]
-                    toks = [t for t in row.tokens if tail in t.text] or row.tokens
-                    hits.append((key, value, toks))
+                    # The tokens the printed value spans (several when it is printed in space-separated groups).
+                    toks = [t for t, s in zip(row.tokens, starts) if s < m.end(1) and s + len(t.text) > m.start(1)]
+                    hits.append((key, value, toks or row.tokens))
             if not hits:
                 continue
             found["remit_routing"] += [(v, t) for k, v, t in hits if k == "remit_routing"]
@@ -443,11 +451,28 @@ class InvoiceParser:
                 continue
             value, toks = cands[0]
             label = {"remit_bank_name": "bank", "remit_routing": "routing", "remit_account": "account"}[key]
-            f = Field_(raw=value, value=value, evidence=evidence_for(toks, label))
-            distinct = {(c[0].upper() if key != "remit_bank_name" else _norm(c[0])) for c in cands}
-            if len(distinct) > 1:
-                f.value, f.note = None, f"{len(distinct)} different {label} values printed"
-            setattr(self.inv, key, f)
+            if key == "remit_bank_name":
+                f = Field_(raw=value, value=value, evidence=evidence_for(toks, label))
+                distinct = {_norm(c[0]) for c in cands}
+                if len(distinct) > 1:
+                    f.value, f.note = None, f"{len(distinct)} different {label} values printed"
+                setattr(self.inv, key, f)
+                continue
+            readings: list[Field_] = []
+            for v, ts in cands:  # one reading per distinct identifier: the full form, else the clearest copy
+                ev = evidence_for(ts, label)
+                same = next((r for r in readings if same_identifier(r.value, v)), None)
+                if same is None:
+                    readings.append(Field_(raw=v, value=v, evidence=ev))
+                elif (is_masked(same.value) and not is_masked(v)) or (
+                        is_masked(same.value) == is_masked(v) and ev.conf > same.evidence.conf):
+                    same.raw, same.value, same.evidence = v, v, ev
+            if len(readings) == 1:
+                setattr(self.inv, key, readings[0])
+                continue
+            setattr(self.inv, key, Field_(raw=readings[0].raw, evidence=readings[0].evidence,
+                                          note=f"{len(readings)} different {label} values printed"))
+            self.inv.remit_readings[key] = readings
         for row in self.rows:
             text = " ".join(t.text for t in row.tokens)
             m = _CHANGE_NOTICE_RE.search(text)
