@@ -76,6 +76,9 @@ class ExtractedInvoice(BaseModel):
     po_reference: Field_ = Field(default_factory=Field_)
     # Informational: a delivery note / delivery reference printed on the invoice (never used to allocate).
     delivery_reference: Field_ = Field(default_factory=Field_)
+    # Printed service / billing period, e.g. value "2026-09" for "September 2026". Used to tell recurring
+    # charges apart and to corroborate a resent copy; never used to allocate.
+    service_period: Field_ = Field(default_factory=Field_)
     currency: Field_ = Field(default_factory=Field_)
     net: Field_ = Field(default_factory=Field_)  # cents
     tax: Field_ = Field(default_factory=Field_)  # cents
@@ -115,4 +118,8 @@ class Decision(BaseModel):
     po_candidates: Optional[dict[str, Any]] = None
     # Unit price vs PO price for every mapped line, with signed variance and amount difference.
     price_check: Optional[dict[str, Any]] = None
+    # How the supplier name was resolved (exact legal name, or a unique legal-suffix variant), with the compared forms.
+    vendor_match: Optional[dict[str, Any]] = None
+    # How each invoice line was mapped to a PO line: by printed SKU, or (SKU not printed) by verified description.
+    line_matches: Optional[list[dict[str, Any]]] = None
     policy_version: str

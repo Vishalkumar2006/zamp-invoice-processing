@@ -86,7 +86,7 @@ upload ─► persist PDF + run (QUEUED) ─► worker claims run
   The app makes no model calls at runtime.
 - **Decision** (`app/rules.py`) is a pure function, `evaluate(invoice, snapshot)`, with no I/O. Rules run in priority order:
   evidence (every critical value present and at or above OCR confidence 80), unique approved vendor by
-  normalized legal name, business duplicate (vendor and invoice number), printed PO (exists, same vendor, same
+  normalized legal name (exact first, then a unique legal-suffix variant), business duplicate (vendor and invoice number), printed PO (exists, same vendor, same
   currency, OPEN), arithmetic (qty × rate = amount, lines = net, net + tax = gross), SKU-to-PO-line mapping, unit
   price within **1% inclusive**, and a **strict cumulative cap** on net and quantity, counting prior allocations.
 - **Cumulative overbilling.** Every cap is compared, with no early exit: quantity and net for each affected PO line,
@@ -99,7 +99,7 @@ upload ─► persist PDF + run (QUEUED) ─► worker claims run
   even after the live ledger has moved. The live balance is shown separately.
 - **Business duplicates.** The key is the approved vendor ID plus the printed invoice number, normalized
   conservatively: uppercase, inner spaces removed, dash variants unified. Leading zeros and punctuation are kept,
-  so `INV-00417`, `INV-417` and `INV00417` are three different invoices. Only previously *accepted* (allocated)
+  so `INV-00417`, `INV-417` and `INV00417` are three different keys (see leading-zero variants below). Only previously *accepted* (allocated)
   invoices are looked up, so a corrected resubmission after a `HOLD` is evaluated normally. On a key match, the
   document is compared field by field with the accepted invoice: invoice date, currency, net, tax, total, PO, and
   each line's SKU, quantity, unit price and amount. If everything matches, it's a corroborated copy:
@@ -131,6 +131,26 @@ upload ─► persist PDF + run (QUEUED) ─► worker claims run
   display never decides anything. The decision also records the subtotal at invoice prices against the subtotal at PO prices. When
   line differences cancel out, the hold says so explicitly. Tax is reported separately; authorization and
   allocations stay pre-tax. The next action names each affected line and its PO price.
+- **Leading-zero variants.** A printed number equal to an accepted number of the same vendor apart from leading
+  zeros (`INV-0417` vs `INV-417`) is kept as printed and compared with the accepted invoice: PO, service period
+  (printed on both), currency, net, tax, total and lines. Fully corroborated with the same invoice date, it is
+  `BLOCKED / DUPLICATE_INVOICE`, linked to the accepted run; corroborated but re-dated, it is
+  `HOLD / DUPLICATE_IDENTITY_UNCERTAIN`. Otherwise the variant is recorded and the normal checks run: the same
+  vendor, PO and amount alone never make a duplicate.
+- **Vendor names.** The exact normalized legal name always wins. With no exact match, a printed name that differs
+  from one legal name only by a legal suffix on one side (`Acme Field Services` vs `Acme Field Services Inc.`) matches if it is
+  unique across the whole vendor master and the remaining name has at least two words. Two candidates hold as
+  `VENDOR_AMBIGUOUS`; different suffixes (`… LLC` vs `… Inc`) never match. The method and compared forms are stored.
+- **Description-only lines.** A line with no printed SKU keeps its SKU null. On a printed PO, it maps to the one PO
+  line whose description shares at least two and at least 60% of its meaningful words (months, years and numbers
+  ignored); none or several qualifying lines hold as `LINE_NOT_ON_PO`. The resolved PO line, shared words and CSV
+  row are stored, and price, quantity and authorization checks apply as usual. Without a printed PO such a line is
+  never matched.
+- **Tax wording and service period.** A tax cell printed as `Not applicable`, `N/A`, `Exempt` and similar reads
+  as zero only when the printed subtotal equals the total; the words stay as the raw value and evidence. A printed
+  `Service period` (`September 2026`, or an ISO date range) is extracted with evidence.
+- **Overbilling next action** shows the PO's remaining net under its own label and each line's remaining net and
+  quantity labelled by SKU.
 - **Candidate line mapping** uses the same rule as an explicit PO: each invoice line needs its own PO line. A
   candidate PO that would map two invoice rows to one PO line is shown as ineligible, with the reason.
 - **Money** is stored as integer cents. Rates, quantities and tolerance use `Decimal`.
@@ -177,6 +197,11 @@ supplied sample. They cover:
   near-limit variances that round to 1.00% (`+1.001%`/`-1.001%` held and displayed as such, `+0.9999%` accepted)
   in the reason, check detail, candidate table and over HTTP;
 - a repeated SKU against a candidate PO, ineligible just like an explicit PO;
+- service invoices: tax wording with and without reconciling totals, service periods, legal-suffix vendor
+  variants (unique, ambiguous, exact precedence, different suffix, inactive), description-only lines (unique,
+  ambiguous, no match, price and quantity still checked, no printed PO, unclear description), a next-month charge
+  with the same amount, a resent copy with leading zeros (blocked when corroborated, held when re-dated, normal
+  checks without period corroboration), and the existing exact-number block;
 - layout variants: `Invoice #:` and `Customer PO:` style labels, right-aligned figures under left-aligned headers,
   numbers inside descriptions, a missing or doubled quantity (held), and a two-shipment PO where the second
   shipment is held for exceeding one SKU's quantity and the PO total;

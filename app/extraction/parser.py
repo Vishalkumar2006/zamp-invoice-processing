@@ -138,6 +138,7 @@ LABELS: dict[str, re.Pattern[str]] = {
     "net": re.compile(r"^(sub ?total|net( total| amount)?|total before tax|subtotal \(excl\.? tax\))" + _CUR + "$"),
     "tax": re.compile(r"^((sales )?tax|vat|gst)( \(?[\d.]+ ?%\)?)?" + _CUR + "$"),
     "gross": re.compile(r"^((grand |invoice )?total( due| amount)?|(amount|balance) due)" + _CUR + "$"),
+    "service_period": re.compile(r"^(service period|billing period|period of service|service dates?)$"),
 }
 TOTAL_KEYS = ("net", "tax", "gross")
 # Spaces in label patterns are optional so OCR word splits/joins ("S ubtotal", "Invoicenumber")
@@ -197,6 +198,29 @@ def parse_date(text: str) -> tuple[Optional[str], Optional[str]]:
             except ValueError:
                 return None, "invalid date"
     return None, "unrecognised date format"
+
+
+_PERIOD_MONTH_FORMATS = ("%B %Y", "%b %Y", "%b. %Y", "%Y-%m")
+_ISO_RANGE = re.compile(r"^(\d{4}-\d{2}-\d{2}) ?(?:-|–|—|to|through|thru) ?(\d{4}-\d{2}-\d{2})$", re.IGNORECASE)
+
+
+def parse_period(text: str) -> tuple[Optional[str], Optional[str]]:
+    """Service period: a calendar month ("September 2026" -> "2026-09") or an ISO date range
+    ("2026-09-01 to 2026-09-30" -> "2026-09-01/2026-09-30"). Anything else stays unparsed."""
+    s = re.sub(r"\s+", " ", text.strip().rstrip("."))
+    for fmt in _PERIOD_MONTH_FORMATS:
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m"), None
+        except ValueError:
+            continue
+    m = _ISO_RANGE.match(s)
+    if m and m.group(1) <= m.group(2):
+        return f"{m.group(1)}/{m.group(2)}", None
+    return None, "unrecognised period format"
+
+
+# Printed wording that states no tax is charged. Read as zero only when subtotal equals total.
+_NO_TAX = re.compile(r"^(not applicable|n/?a|none|nil|exempt|tax exempt|not taxable|no tax|zero rated)$")
 
 
 def norm_identifier(text: str) -> str:
@@ -341,6 +365,38 @@ class InvoiceParser:
                                        note="inferred from '$' symbol; no ISO code printed")
         else:
             self.inv.issues.append("currency: no currency code or symbol found")
+
+    def _no_tax_wording(self) -> None:
+        """A tax cell printed as words ("Not applicable", "Exempt") is zero tax only if the printed
+        subtotal and total agree; the words stay as the raw value and evidence. Otherwise it stays unparsed."""
+        tax = self.inv.tax
+        if tax.value is not None or tax.raw is None or not _NO_TAX.match(_norm(tax.raw)):
+            return
+        net, gross = self.inv.net.value, self.inv.gross.value
+        issue = next((i for i in self.inv.issues if i.startswith("tax: could not parse")), None)
+        if net is not None and net == gross:
+            tax.value = 0
+            tax.note = f"printed as {tax.raw!r}; read as 0 because the subtotal equals the total"
+            if issue:
+                self.inv.issues.remove(issue)
+        elif issue:
+            self.inv.issues[self.inv.issues.index(issue)] = (
+                f"tax: printed as {tax.raw!r} but the subtotal and total differ")
+
+    def _service_period(self, cands) -> None:
+        """Informational: never blocks extraction. An unparsed period keeps its raw text and evidence."""
+        if not cands:
+            return
+        parsed = []
+        for toks, label_toks, _cur in cands:
+            raw = " ".join(t.text for t in toks)
+            value, err = parse_period(raw)
+            parsed.append((raw, value, err, toks, " ".join(t.text for t in label_toks)))
+        raw, value, err, toks, label = next((p for p in parsed if p[2] is None), parsed[0])
+        f = Field_(raw=raw, value=value, evidence=evidence_for(toks, label), note=err)
+        if len({p[1] for p in parsed if p[2] is None}) > 1:
+            f.value, f.note = None, "conflicting service periods: " + ", ".join(sorted({p[0] for p in parsed}))
+        self.inv.service_period = f
 
     _DELIVERY_RE = re.compile(
         r"deliver(?:y)?\s*(?:note|ref(?:erence)?\.?|receipt)\s*(?:no\.?|number|#)?\s*[:#]?\s*"
@@ -490,6 +546,8 @@ class InvoiceParser:
             self._assign(key, cands,
                          lambda r: (lambda c: (c, None) if c is not None else (None, "not a money amount"))(
                              parse_money_cents(r)))
+        self._no_tax_wording()
+        self._service_period(labelled.get("service_period", []))
         self._currency(labelled)
         self._delivery_reference()
         self._lines()

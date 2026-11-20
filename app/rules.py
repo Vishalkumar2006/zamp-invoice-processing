@@ -4,18 +4,22 @@ evaluate(invoice, snapshot) -> Decision
 
 Priority order (first failing rule decides):
   1. evidence      critical fields present, unambiguous and above the confidence floor
-  2. vendor        unique approved vendor by normalised legal name
+  2. vendor        unique approved vendor by normalised legal name (exact first; else a unique
+                   legal-suffix variant, e.g. printed "Acme Tools" for legal "Acme Tools Inc.")
   3. duplicate     vendor + invoice number already accepted -> BLOCKED (corroborated copy) /
-                   HOLD (material conflict, or OCR-confusable near match)
+                   HOLD (material conflict, or OCR-confusable near match). A number that differs only
+                   in leading zeros is BLOCKED when fully corroborated, else HOLD.
   4. po            printed PO exists, belongs to the vendor, same currency, OPEN
   5. arithmetic    qty x rate = line amount, lines = net, net + tax = gross
-  6. line mapping  every invoice line maps by SKU to exactly one PO line
+  6. line mapping  every invoice line maps by SKU to exactly one PO line; a line with no printed SKU
+                   maps by its verified description to a unique line on the printed PO
   7. price         unit price within 1% (inclusive) of the PO unit price
   8. authorization cumulative net and quantity (prior allocations + this invoice) <= PO authorization
   -> READY with one allocation
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from decimal import ROUND_DOWN, ROUND_HALF_UP, ROUND_UP, Decimal
 from typing import Any, Optional
@@ -68,7 +72,8 @@ def po_balance(snap: Snapshot, po_id: str) -> dict[str, Any]:
 def evaluate(inv: ExtractedInvoice, snap: Snapshot, *, min_conf: float, policy_version: str) -> Decision:
     checks: list[dict[str, Any]] = []
     ctx: dict[str, Any] = {"vendor": None, "po": None, "candidates": [], "prior": [], "authorization": None,
-                           "reason_codes": [], "duplicate": None, "po_candidates": None, "price_check": None}
+                           "reason_codes": [], "duplicate": None, "po_candidates": None, "price_check": None,
+                           "vendor_match": None, "line_matches": None}
 
     def check(rule: str, ok: bool, detail: str, **compared: Any) -> bool:
         checks.append({"rule": rule, "status": "pass" if ok else "fail", "detail": detail, "compared": compared})
@@ -76,13 +81,13 @@ def evaluate(inv: ExtractedInvoice, snap: Snapshot, *, min_conf: float, policy_v
 
     try:
         _evidence(inv, min_conf, check)
-        vendor = _vendor(inv, snap, check)
+        vendor = _vendor(inv, snap, check, ctx)
         ctx["vendor"] = vendor
         _duplicate(inv, snap, vendor, check, ctx)
         po = _po(inv, snap, vendor, check, ctx)
         ctx["po"] = po
         _arithmetic(inv, check)
-        mapping = _line_mapping(inv, snap, po, check)
+        mapping = _line_mapping(inv, snap, po, check, ctx)
         _price(inv, po, mapping, check, ctx)
         allocation = _authorization(inv, snap, po, mapping, check, ctx)
     except _Stop as stop:
@@ -94,7 +99,7 @@ def evaluate(inv: ExtractedInvoice, snap: Snapshot, *, min_conf: float, policy_v
             checks=checks, prior_allocations=ctx["prior"], review_field=stop.review_field,
             reason_codes=ctx["reason_codes"] or [stop.code], authorization=ctx["authorization"],
             duplicate=ctx["duplicate"], po_candidates=ctx["po_candidates"], price_check=ctx["price_check"],
-            policy_version=policy_version,
+            vendor_match=ctx["vendor_match"], line_matches=ctx["line_matches"], policy_version=policy_version,
         )
     cur = po["currency"]
     return Decision(
@@ -107,7 +112,7 @@ def evaluate(inv: ExtractedInvoice, snap: Snapshot, *, min_conf: float, policy_v
         checks=checks, allocation=allocation, prior_allocations=ctx["prior"],
         reason_codes=["MATCHED_WITHIN_AUTHORIZATION"], authorization=ctx["authorization"],
         duplicate=ctx["duplicate"], price_check=ctx["price_check"],
-        policy_version=policy_version,
+        vendor_match=ctx["vendor_match"], line_matches=ctx["line_matches"], policy_version=policy_version,
     )
 
 
@@ -123,7 +128,10 @@ def _evidence(inv: ExtractedInvoice, min_conf: float, check) -> None:
     if inv.po_reference.raw is not None:
         critical.append(("po_reference", inv.po_reference))
     for i, line in enumerate(inv.lines, start=1):
-        for name in ("sku", "quantity", "unit_price", "amount"):
+        # No SKU printed at all: the verified description identifies the charge instead (mapped later,
+        # only on a printed PO). A printed but unreadable SKU still holds here.
+        ident = "description" if line.sku.raw is None and line.description.value else "sku"
+        for name in (ident, "quantity", "unit_price", "amount"):
             critical.append((f"line {i} {name}", getattr(line, name)))
     for name, f in critical:
         if f.value is None or f.evidence is None:
@@ -157,22 +165,68 @@ def _evidence(inv: ExtractedInvoice, min_conf: float, check) -> None:
           min_conf_observed=min(f.evidence.conf for _, f in critical))
 
 
-def _vendor(inv: ExtractedInvoice, snap: Snapshot, check) -> dict[str, Any]:
+LEGAL_SUFFIXES = ("incorporated", "inc", "l l c", "llc", "limited", "ltd", "company", "co", "corporation", "corp",
+                  "plc", "llp", "lp", "pllc", "gmbh", "pty")
+
+
+def split_legal_suffix(normalized: str) -> tuple[str, str]:
+    """("brightpath it services inc") -> ("brightpath it services", "inc"); no suffix -> (name, "")."""
+    words = normalized.split()
+    for suf in sorted(LEGAL_SUFFIXES, key=lambda s: -len(s.split())):
+        sw = suf.split()
+        if len(words) > len(sw) and words[-len(sw):] == sw:
+            return " ".join(words[:-len(sw)]), suf
+    return normalized, ""
+
+
+def _vendor(inv: ExtractedInvoice, snap: Snapshot, check, ctx) -> dict[str, Any]:
+    """Exact normalised legal name first. Only if nothing matches exactly: a legal-suffix variant, where one
+    side carries a legal suffix and the other none and the remaining names are equal (at least two words).
+    It must be unique across the whole vendor master; different suffixes never match."""
     name = inv.supplier_name.value
     n = norm_name(name)
+    source = lambda v: f"{v['source_file']} row {v['source_row']}"
     matches = [v for v in snap.vendors if v["legal_name_norm"] == n]
+    method, extra = "exact", {}
+    if not matches:
+        base, suf = split_legal_suffix(n)
+        variants = []
+        if len(base.split()) >= 2:
+            for v in snap.vendors:
+                vbase, vsuf = split_legal_suffix(v["legal_name_norm"])
+                if vbase == base and (suf == "") != (vsuf == ""):
+                    variants.append((v, vsuf))
+        if len(variants) > 1:
+            names = ", ".join(f"{v['vendor_id']} {v['legal_name']}" for v, _ in variants)
+            check("vendor", False, f"no exact match for {name!r}; {len(variants)} legal-suffix variants: {names}",
+                  supplier=name, normalized=n, candidates=[v["vendor_id"] for v, _ in variants])
+            raise _Stop("HOLD", "VENDOR_AMBIGUOUS",
+                        f"Supplier {name!r} has no exact match and could be any of {names} (same name, different "
+                        f"legal suffix).", "Confirm which vendor issued the invoice.", review_field="supplier_name")
+        if len(variants) == 1:
+            v, vsuf = variants[0]
+            matches, method = [v], "legal_suffix_variant"
+            extra = {"name_without_suffix": base, "suffix_printed": suf or None, "suffix_on_legal_name": vsuf or None,
+                     "vendors_compared": len(snap.vendors)}
     if len(matches) != 1:
         check("vendor", False, f"{len(matches)} vendors match {name!r}", supplier=name, normalized=n)
         raise _Stop("HOLD", "VENDOR_NOT_FOUND" if not matches else "VENDOR_AMBIGUOUS",
                     f"Supplier {name!r} does not match exactly one vendor in the vendor master.",
                     "Confirm the vendor or add it to the vendor master.", review_field="supplier_name")
     v = matches[0]
+    ctx["vendor_match"] = {"method": method, "printed": name, "printed_normalized": n, "vendor_id": v["vendor_id"],
+                           "legal_name": v["legal_name"], "legal_name_normalized": v["legal_name_norm"],
+                           "source": source(v), "evidence": inv.supplier_name.evidence.model_dump()
+                           if inv.supplier_name.evidence else None, **extra}
     if v["status"] != "APPROVED":
         check("vendor", False, f"{v['vendor_id']} status is {v['status']}", vendor_id=v["vendor_id"])
         raise _Stop("HOLD", "VENDOR_NOT_APPROVED", f"Vendor {v['legal_name']} ({v['vendor_id']}) is {v['status']}.",
                     "Confirm vendor approval with procurement.")
-    check("vendor", True, f"{name!r} -> {v['vendor_id']} {v['legal_name']}", vendor_id=v["vendor_id"],
-          source=f"{v['source_file']} row {v['source_row']}")
+    how = "" if method == "exact" else (
+        f" (legal-suffix variant: the printed name {'omits' if extra['suffix_on_legal_name'] else 'adds'} "
+        f"'{extra['suffix_on_legal_name'] or extra['suffix_printed']}'; unique among {len(snap.vendors)} vendors)")
+    check("vendor", True, f"{name!r} -> {v['vendor_id']} {v['legal_name']}{how}", vendor_id=v["vendor_id"],
+          source=source(v), match_method=method)
     return v
 
 
@@ -187,6 +241,43 @@ def _ocr_canonical(number: str) -> str:
 
 
 _BILLING_FIELDS_EXCLUDED = {"invoice_date"}
+
+_MONTH_WORDS = {"jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+                "january", "february", "march", "april", "june", "july", "august", "september", "october",
+                "november", "december"}
+_DESC_STOP = {"the", "and", "for", "with", "per", "from", "each", "all"}
+
+
+def description_words(text: Optional[str]) -> set[str]:
+    """Meaningful words of a line description: 3+ characters, not a bare number, month or filler word.
+    Months and years are dropped so the same service matches in any billing month."""
+    return {w for w in norm_name(text or "").split()
+            if len(w) >= 3 and not w.isdigit() and w not in _MONTH_WORDS and w not in _DESC_STOP}
+
+
+def match_description(description: Optional[str], po_lines: list[dict[str, Any]]) -> dict[str, Any]:
+    """Map a line with no printed SKU to a PO line by description. A PO line qualifies when the invoice
+    description contains at least 2 of its meaningful words and at least 60% of them. Exactly one line on
+    the PO must qualify; otherwise there is no match (none) or no defensible choice (ambiguous)."""
+    inv_words = description_words(description)
+    cands = []
+    for pl in po_lines:
+        po_words = description_words(pl.get("description"))
+        shared = sorted(po_words & inv_words)
+        qualifies = len(shared) >= 2 and len(shared) * 5 >= len(po_words) * 3
+        cands.append({"po_line_id": pl["line_id"], "po_sku": pl["sku"], "po_description": pl.get("description"),
+                      "po_words": sorted(po_words), "shared_words": shared, "qualifies": qualifies,
+                      "source": f"{pl['source_file']} row {pl['source_row']}" if "source_file" in pl else None})
+    ok = [c for c in cands if c["qualifies"]]
+    status = "matched" if len(ok) == 1 else ("ambiguous" if ok else "no_match")
+    return {"status": status, "match": ok[0] if len(ok) == 1 else None, "candidates": cands,
+            "invoice_words": sorted(inv_words)}
+
+
+def _unpadded(number: str) -> str:
+    """Invoice number with leading zeros removed from each digit group ("INV-0417" -> "INV-417"). Used only
+    to find a *variant* of an accepted number; never to declare two numbers equal."""
+    return re.sub(r"\d+", lambda m: str(int(m.group())), number)
 
 
 def _clearly_distinct(inv: ExtractedInvoice, a: dict[str, Any], comparison: list[dict[str, Any]]) -> bool:
@@ -204,10 +295,11 @@ def _accepted_record(a: dict[str, Any]) -> dict[str, Any]:
     return {"run_id": a["run_id"], "allocation_id": a.get("id"), "invoice_number": a["invoice_number_norm"],
             "invoice_date": a.get("invoice_date"), "accepted_at": a.get("created_at"), "po_id": a["po_id"],
             "currency": a["currency"], "net_cents": a["net_cents"], "tax_cents": a["tax_cents"],
-            "gross_cents": a["gross_cents"]}
+            "gross_cents": a["gross_cents"], "service_period": a.get("service_period")}
 
 
-def _compare_with_accepted(inv: ExtractedInvoice, a: dict[str, Any]) -> list[dict[str, Any]]:
+def _compare_with_accepted(inv: ExtractedInvoice, a: dict[str, Any],
+                           snap: Optional[Snapshot] = None) -> list[dict[str, Any]]:
     """Field-by-field comparison of the incoming document with the accepted invoice.
 
     status: match | conflict | not_printed (an optional value absent on the incoming copy)."""
@@ -227,13 +319,23 @@ def _compare_with_accepted(inv: ExtractedInvoice, a: dict[str, Any]) -> list[dic
     row("gross", inv.gross.value, a["gross_cents"], money=True)
     row("po_reference", inv.po_reference.value, a["po_id"], optional=True)
     acc_lines = {l["sku"]: l for l in a.get("lines", [])}
-    inc_skus = [l.sku.value for l in inv.lines]
-    row("line_skus", sorted(inc_skus), sorted(acc_lines))
+    # Lines with no printed SKU are compared through the PO line their description resolves to on the
+    # accepted invoice's PO (same matcher as allocation); an unresolved line compares as "?".
+    po_lines = snap.po_lines.get(a["po_id"], []) if snap else []
+    keys = []
     for line in inv.lines:
-        al = acc_lines.get(line.sku.value)
+        k = line.sku.value
+        if k is None and po_lines:
+            m = match_description(line.description.value, po_lines)
+            k = m["match"]["po_sku"] if m["match"] else None
+        keys.append(k)
+    described = any(line.sku.value is None for line in inv.lines)
+    row("po_line_skus (by description)" if described else "line_skus", sorted(k or "?" for k in keys),
+        sorted(acc_lines))
+    for line, sku in zip(inv.lines, keys):
+        al = acc_lines.get(sku)
         if al is None:
             continue
-        sku = line.sku.value
         row(f"{sku} quantity", norm_decimal(Decimal(line.quantity.value)), norm_decimal(Decimal(al["quantity"])))
         row(f"{sku} unit_price", norm_decimal(Decimal(line.unit_price.value)), norm_decimal(Decimal(al["unit_price"])))
         row(f"{sku} amount", line.amount.value, al["net_cents"], money=True)
@@ -254,13 +356,14 @@ def _duplicate(inv, snap: Snapshot, vendor, check, ctx) -> None:
     ctx["duplicate"] = dup
 
     if not exact:
+        _number_variant(inv, snap, vendor, accepted, key, check, ctx, dup)
         # Fail closed on uncertain identity: an OCR-read number that differs from an accepted number
         # of the same vendor only by OCR-confusable characters is not a verified distinct number.
         ev = inv.invoice_number.evidence
         if ev is not None and ev.method == "ocr":
             near = [a for a in accepted if _ocr_canonical(a["invoice_number_norm"]) == _ocr_canonical(key)]
             for a in near:
-                comparison = _compare_with_accepted(inv, a)
+                comparison = _compare_with_accepted(inv, a, snap)
                 if _clearly_distinct(inv, a, comparison):
                     # A confidently read, different number backed by a later date and different
                     # billing details is a separate invoice: record why, then run the normal checks.
@@ -287,7 +390,7 @@ def _duplicate(inv, snap: Snapshot, vendor, check, ctx) -> None:
         return
 
     a = exact[0]
-    comparison = _compare_with_accepted(inv, a)
+    comparison = _compare_with_accepted(inv, a, snap)
     conflicts = [r for r in comparison if r["status"] == "conflict"]
     dup.update(accepted=_accepted_record(a), comparison=comparison,
                outcome="conflict" if conflicts else "corroborated")
@@ -321,6 +424,57 @@ def _duplicate(inv, snap: Snapshot, vendor, check, ctx) -> None:
                 review_field="invoice_" + ("date" if conflicts[0]["field"] == "invoice_date" else "number"))
 
 
+def _number_variant(inv, snap: Snapshot, vendor, accepted, key, check, ctx, dup) -> None:
+    """A printed number equal to an accepted number of the same vendor apart from leading zeros
+    ("INV-0417" vs "INV-417"). It is routed to a duplicate outcome only when corroborated: the same PO,
+    service period (printed on both) and billing details (currency, net, tax, gross, lines).
+      - corroborated and the same invoice date -> BLOCKED DUPLICATE_INVOICE, linked to the accepted run;
+      - corroborated but a different invoice date (a re-dated copy) -> HOLD DUPLICATE_IDENTITY_UNCERTAIN.
+    Otherwise the variant is recorded and the normal checks run: same vendor, PO and amount alone are not
+    enough to call it a duplicate."""
+    variants = [a for a in accepted
+                if a["invoice_number_norm"] != key and _unpadded(a["invoice_number_norm"]) == _unpadded(key)]
+    for a in variants:
+        comparison = _compare_with_accepted(inv, a, snap)
+        inc_p, acc_p = inv.service_period.value, a.get("service_period")
+        comparison.append({"field": "service_period", "incoming": inc_p, "accepted": acc_p, "money": False,
+                           "status": "match" if inc_p is not None and inc_p == acc_p else
+                           ("missing" if inc_p is None or acc_p is None else "conflict")})
+        corroborating = [r for r in comparison if r["field"] != "invoice_date"]
+        corroborated = all(r["status"] == "match" for r in corroborating)
+        same_date = next(r for r in comparison if r["field"] == "invoice_date")["status"] == "match"
+        num = a["invoice_number_norm"]
+        record = {"accepted": _accepted_record(a), "comparison": comparison,
+                  "number_variant": {"printed": key, "accepted": num, "rule": "equal apart from leading zeros"}}
+        if not corroborated:
+            dup.setdefault("near_matches", []).append({**record, "outcome": "variant_not_corroborated"})
+            continue
+        dup.update(record, outcome="variant_corroborated" if same_date else "variant_uncertain")
+        ctx["po"] = snap.pos.get(a["po_id"])
+        ctx["prior"] = [{"run_id": a["run_id"], "invoice_number_norm": num, "po_id": a["po_id"],
+                         "net_cents": a["net_cents"], "gross_cents": a["gross_cents"]}]
+        matched = ", ".join(r["field"] for r in comparison if r["status"] == "match")
+        accepted_on = (a.get("created_at") or "")[:10]
+        if same_date:
+            check("duplicate", False, f"{vendor['vendor_id']} / {key} repeats accepted {num} (run {a['run_id']}); "
+                  f"numbers equal apart from leading zeros; corroborated: {matched}", accepted_run=a["run_id"])
+            raise _Stop("BLOCKED", "DUPLICATE_INVOICE",
+                        f"Invoice {key} from {vendor['legal_name']} repeats invoice {num}, accepted on {accepted_on} "
+                        f"(run {a['run_id']}). The numbers are the same apart from leading zeros, and the PO "
+                        f"{a['po_id']}, service period {acc_p}, invoice date and billing details all match: {matched}.",
+                        f"Do not pay again. Close this submission as a copy of {num} (run {a['run_id']}) and tell "
+                        f"the vendor the original is already in process.", review_field="invoice_number")
+        check("duplicate", False, f"{vendor['vendor_id']} / {key} matches accepted {num} (run {a['run_id']}) apart "
+              f"from leading zeros and the invoice date", accepted_run=a["run_id"])
+        raise _Stop("HOLD", "DUPLICATE_IDENTITY_UNCERTAIN",
+                    f"Invoice {key} matches accepted invoice {num} (run {a['run_id']}) apart from leading zeros: same "
+                    f"PO {a['po_id']}, service period {acc_p} and billing details, but a different invoice date "
+                    f"(accepted {a.get('invoice_date')}, this document {inv.invoice_date.value}).",
+                    f"Compare this document with {num} (run {a['run_id']}). If it is a re-dated copy, close it as a "
+                    f"duplicate; if it is a new charge, ask {vendor['legal_name']} for a distinct invoice number.",
+                    review_field="invoice_number")
+
+
 def _candidate_evidence(inv: ExtractedInvoice, snap: Snapshot, po: dict[str, Any], vendor) -> dict[str, Any]:
     """Compare one vendor PO with the verified invoice lines. Pure; used only to explain a hold."""
     bal = po_balance(snap, po["po_id"])
@@ -341,7 +495,8 @@ def _candidate_evidence(inv: ExtractedInvoice, snap: Snapshot, po: dict[str, Any
                                "po_line_id": None, "source": None}
         if pl is None:
             row.update(sku_ok=False, price_ok=False, quantity_ok=False, amount_ok=False)
-            failures.append(f"no {sku} line")
+            failures.append(f"no {sku} line" if sku else
+                            f"invoice line {i} has no SKU (a description-only line is matched only on a printed PO)")
             lines.append(row)
             continue
         if pl["line_id"] in mapped_by:
@@ -490,11 +645,47 @@ def _arithmetic(inv: ExtractedInvoice, check) -> None:
                     "Ask the vendor to correct the invoice totals.", review_field="gross")
 
 
-def _line_mapping(inv, snap: Snapshot, po, check) -> list[tuple[Any, dict[str, Any]]]:
-    by_sku = {pl["sku"]: pl for pl in snap.po_lines.get(po["po_id"], [])}
+def _line_mapping(inv, snap: Snapshot, po, check, ctx) -> list[tuple[Any, dict[str, Any]]]:
+    po_lines = snap.po_lines.get(po["po_id"], [])
+    by_sku = {pl["sku"]: pl for pl in po_lines}
+    by_id = {pl["line_id"]: pl for pl in po_lines}
     mapping = []
     seen: set[str] = set()
+    records: list[dict[str, Any]] = []
+    ctx["line_matches"] = records
     for i, line in enumerate(inv.lines, start=1):
+        if line.sku.value is None and line.sku.raw is None:
+            # No SKU printed: resolve by verified description on the printed PO; the extracted SKU stays null.
+            m = match_description(line.description.value, po_lines)
+            ev = line.description.evidence
+            rec = {"line": i, "method": "description", "invoice_sku": None, "invoice_description": line.description.value,
+                   "invoice_description_evidence": ev.model_dump() if ev else None, "status": m["status"],
+                   "invoice_words": m["invoice_words"], "candidates": m["candidates"], "po_id": po["po_id"],
+                   "rule": "at least 2 and at least 60% of the PO line's meaningful words; exactly one qualifying line"}
+            records.append(rec)
+            hit = m["match"]
+            if hit is None or hit["po_line_id"] in seen:
+                why = ("its description fits more than one line: " + ", ".join(
+                    f"line {c['po_line_id']} {c['po_sku']}" for c in m["candidates"] if c["qualifies"])
+                       if m["status"] == "ambiguous" else
+                       "it is already mapped to another invoice line" if hit else
+                       "its description does not clearly match any line")
+                check("line_mapping", False, f"line {i} (no SKU printed) on {po['po_id']}: {why}",
+                      description=line.description.value, candidates=m["candidates"])
+                raise _Stop("HOLD", "LINE_NOT_ON_PO",
+                            f"Invoice line {i} has no SKU and {why} on {po['po_id']}.",
+                            "Confirm which PO line this charge belongs to.", review_field=f"line {i} description")
+            pl = by_id[hit["po_line_id"]]
+            seen.add(pl["line_id"])
+            mapping.append((line, pl))
+            rec.update(po_line_id=pl["line_id"], po_sku=pl["sku"], po_description=pl.get("description"),
+                       shared_words=hit["shared_words"], po_words=hit["po_words"],
+                       source=f"{pl['source_file']} row {pl['source_row']}")
+            check("line_mapping", True, f"line {i} (no SKU printed) -> {po['po_id']} line {pl['line_id']} {pl['sku']} "
+                  f"by description: shares {', '.join(hit['shared_words'])} ({len(hit['shared_words'])} of "
+                  f"{len(hit['po_words'])} PO-line words); the only qualifying line",
+                  po_line=pl["line_id"], source=rec["source"], match_method="description")
+            continue
         pl = by_sku.get(line.sku.value)
         if pl is None or pl["line_id"] in seen:
             check("line_mapping", False, f"line {i} SKU {line.sku.value} has no unique line on {po['po_id']}",
@@ -504,6 +695,8 @@ def _line_mapping(inv, snap: Snapshot, po, check) -> list[tuple[Any, dict[str, A
                         "Confirm which PO line this charge belongs to.", review_field=f"line {i} sku")
         seen.add(pl["line_id"])
         mapping.append((line, pl))
+        records.append({"line": i, "method": "sku", "invoice_sku": line.sku.value, "po_line_id": pl["line_id"],
+                        "po_sku": pl["sku"], "source": f"{pl['source_file']} row {pl['source_row']}"})
         check("line_mapping", True, f"line {i} {line.sku.value} -> {po['po_id']} line {pl['line_id']}",
               sku=line.sku.value, po_line=pl["line_id"], source=f"{pl['source_file']} row {pl['source_row']}")
     return mapping
@@ -564,7 +757,8 @@ def _price(inv, po, mapping, check, ctx) -> None:
         at_po_price = decimal_to_cents(qty * po_rate)
         diff_cents = line.amount.value - at_po_price
         ev = line.unit_price.evidence
-        row = {"line": line.row_index + 1, "sku": line.sku.value, "po_id": po["po_id"], "po_line_id": pl["line_id"],
+        row = {"line": line.row_index + 1, "sku": line.sku.value or pl["sku"], "invoice_sku": line.sku.value,
+               "po_id": po["po_id"], "po_line_id": pl["line_id"],
                "quantity": norm_decimal(qty), "invoice_unit_price": norm_decimal(inv_rate),
                "po_unit_price": norm_decimal(po_rate), "variance_pct": f"{_pct_figure(delta, po_rate, 4):f}",
                "variance_display": _signed_pct(delta, po_rate),
@@ -732,12 +926,16 @@ def _authorization_hold(inv, po, cur, comparisons, breaches, prior_invoices, lin
     if money:
         asks.append(f"at least {fmt_cents(max(c['excess'] for c in money), cur)} of net authorization")
     asks += [f"{c['excess']} units of {c['sku']}" for c in qty]
-    net_room = max(min(c["remaining"] for c in comparisons if c["measure"] == "net"), 0)
-    room = [f"{fmt_cents(net_room, cur)} net"] + [
-        f"{c['remaining']} units of {c['sku']}" for c in comparisons if c["measure"] == "quantity"]
+    po_room = next(c for c in comparisons if c["measure"] == "net" and c["scope"] == "po")
+    line_net = {c["line_id"]: c for c in comparisons if c["measure"] == "net" and c["scope"] == "line"}
+    limits = [f"{c['sku']} line: {fmt_cents(max(line_net[c['line_id']]['remaining'], 0), cur)} net / "
+              f"{norm_decimal(max(Decimal(c['remaining']), Decimal(0)))} units"
+              for c in comparisons if c["measure"] == "quantity"]
+    room = f"{po['po_id']} total: {fmt_cents(max(po_room['remaining'], 0), cur)} net remaining" + (
+        "; " + "; ".join(limits) if limits else "")
     action = (f"Do not pay. Ask the PO owner for a change order on {po['po_id']} adding {' and '.join(asks)}, "
               f"or ask {ctx['vendor']['legal_name']} for a corrected invoice or credit note that fits the remaining "
-              f"{' / '.join(room)}. Re-submit when either arrives.")
+              f"authorization ({room}). Re-submit when either arrives.")
 
     if money:
         primary = next((c for c in money if c["scope"] == "po"), money[0])

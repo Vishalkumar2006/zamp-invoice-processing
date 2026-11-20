@@ -92,7 +92,8 @@ function renderDecision(run, d) {
     ${renderAuthorization(run, d)}
     <dl class="kv">
       <dt>Next action</dt><dd><strong>${esc(d.next_action)}</strong></dd>
-      <dt>Vendor</dt><dd>${esc(d.vendor_id || "—")} ${esc(d.vendor_name || "")}</dd>
+      <dt>Vendor</dt><dd>${esc(d.vendor_id || "—")} ${esc(d.vendor_name || "")}${vendorMatch(d)}</dd>
+      ${lineMatches(d)}
       <dt>Matched PO</dt><dd>${esc(d.po_id || "—")}${cands}</dd>
       ${d.review_field ? `<dt>Field to review</dt><dd>${esc(d.review_field)}</dd>` : ""}
       <dt>Allocation</dt><dd>${alloc}</dd>
@@ -123,7 +124,10 @@ function renderDuplicate(d) {
   const rows = dup.comparison.map((r) => `<tr class="${r.status === "conflict" ? "fail" : ""}"><td>${esc(r.field)}</td>
     <td>${val(r, r.incoming)}</td><td>${val(r, r.accepted)}</td><td>${esc(label[r.status] || r.status)}</td></tr>`).join("");
   const title = { corroborated: "Duplicate of an accepted invoice", conflict: "Same invoice number, different content",
-    identity_uncertain: "Possible duplicate (uncertain OCR identity)" }[dup.outcome] || "Duplicate check";
+    identity_uncertain: "Possible duplicate (uncertain OCR identity)",
+    variant_corroborated: "Duplicate of an accepted invoice (number printed with leading zeros)",
+    variant_uncertain: "Possible duplicate (number differs only by leading zeros; different date)" }[dup.outcome]
+    || "Duplicate check";
   return `<h3 class="sub">${esc(title)}</h3>
     <dl class="kv">
       <dt>Business key</dt><dd>vendor <strong>${esc(k.vendor_id)}</strong> ${esc(k.vendor_name || "")} + invoice number
@@ -259,12 +263,31 @@ function renderBalance(bal, d) {
       <th class="num">Net auth</th><th class="num">Net used</th><th class="num">Net left</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
+function vendorMatch(d) {
+  const m = d.vendor_match;
+  if (!m || m.method === "exact") return "";
+  return `<br><span class="muted">matched by legal-suffix variant: printed “${esc(m.printed)}” vs legal name
+    “${esc(m.legal_name)}” (${esc(m.source)}); unique among ${esc(m.vendors_compared)} vendors</span>`;
+}
+
+function lineMatches(d) {
+  const rows = (d.line_matches || []).filter((m) => m.method === "description");
+  if (!rows.length) return "";
+  return `<dt>Line mapping</dt><dd>${rows.map((m) => m.po_line_id
+    ? `Line ${esc(m.line)} (no SKU printed) → ${esc(m.po_id)} line ${esc(m.po_line_id)} ${esc(m.po_sku)}
+       (${esc(m.source)}) by description: shares ${esc((m.shared_words || []).join(", "))}
+       (${esc((m.shared_words || []).length)} of ${esc((m.po_words || []).length)} PO-line words); the only qualifying line`
+    : `Line ${esc(m.line)} (no SKU printed): ${esc(m.status === "ambiguous" ? "description fits more than one PO line"
+       : "description matches no PO line")}`).join("<br>")}</dd>`;
+}
+
 function renderEvidence(x) {
   document.getElementById("evidence-card").hidden = false;
   const inv = x.invoice;
   const cur = inv.currency.value;
   const fields = [["Supplier", "supplier_name"], ["Invoice number", "invoice_number"], ["Invoice date", "invoice_date"],
-    ["PO reference", "po_reference"], ["Delivery reference", "delivery_reference"], ["Currency", "currency"], ["Net / subtotal", "net"], ["Tax", "tax"], ["Total", "gross"]];
+    ["PO reference", "po_reference"], ["Service period", "service_period"], ["Delivery reference", "delivery_reference"],
+    ["Currency", "currency"], ["Net / subtotal", "net"], ["Tax", "tax"], ["Total", "gross"]];
   const val = (k, f) => {
     if (f.value === null || f.value === undefined) return `<span class="muted">${esc(f.note || "—")}</span>`;
     return ["net", "tax", "gross"].includes(k) ? money(f.value, cur) : esc(f.value);

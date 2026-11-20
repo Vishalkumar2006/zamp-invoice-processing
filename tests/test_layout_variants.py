@@ -187,6 +187,9 @@ def test_split_po_shipments_ready_then_overbilling_hold(client):
     assert breaches[("net", "line", "PIPE-34")]["excess"] == 18750 and breaches[("net", "po", None)]["excess"] == 18750
     assert "PIPE-34 quantity 60 already allocated + 55 on this invoice = 115, 15 over the 100 authorized" in second["reason"]
     assert "USD 187.50 over" in second["reason"] and "CPL-12" not in second["reason"]
+    # The PO-level remainder has its own label; per-line limits are labelled by SKU (not one pooled figure).
+    assert ("fits the remaining authorization (PO-5501 total: USD 762.50 net remaining; "
+            "PIPE-34 line: USD 500.00 net / 40 units; CPL-12 line: USD 262.50 net / 150 units)") in d["next_action"]
     assert _po(client, ws) == after_first  # ledger unchanged by the hold
 
 
