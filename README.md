@@ -76,8 +76,12 @@ upload ─► persist PDF + run (QUEUED) ─► worker claims run
 ```
 
 - **Extraction** (`app/extraction/`) only produces an `ExtractedInvoice`. Values come only from a labelled
-  header field (for example `Invoice number`, `Purchase order`, `Subtotal`, `Total due (USD)`) or from a row of the
-  line-item table. A number printed elsewhere is never used. Scans are skew-corrected using Tesseract's own line
+  header field (for example `Invoice number`, `Invoice #:`, `Purchase order`, `Customer PO:`, `Subtotal`,
+  `Total due (USD)`) or from a row of the line-item table. A number printed elsewhere is never used. Table figures go
+  to the column whose header they overlap; a figure under no header text goes to the column band that holds it
+  (from its header's left edge to the next header's), so right-aligned quantities past a left-aligned `Qty` header
+  are read as quantities, while numbers inside a description (dimensions, pack sizes) stay in the description. Two
+  figures in one cell, or none, leave the value empty and the run on hold. Scans are skew-corrected using Tesseract's own line
   groupings before tokens are grouped into rows. Missing or conflicting values stay `null` and are listed as issues.
   The app makes no model calls at runtime.
 - **Decision** (`app/rules.py`) is a pure function, `evaluate(invoice, snapshot)`, with no I/O. Rules run in priority order:
@@ -173,6 +177,9 @@ supplied sample. They cover:
   near-limit variances that round to 1.00% (`+1.001%`/`-1.001%` held and displayed as such, `+0.9999%` accepted)
   in the reason, check detail, candidate table and over HTTP;
 - a repeated SKU against a candidate PO, ineligible just like an explicit PO;
+- layout variants: `Invoice #:` and `Customer PO:` style labels, right-aligned figures under left-aligned headers,
+  numbers inside descriptions, a missing or doubled quantity (held), and a two-shipment PO where the second
+  shipment is held for exceeding one SKU's quantity and the PO total;
 - workspace routing: an upload from a page loaded before a newer import still lands in the page's workspace, an API
   upload without `workspace_id` uses the latest, an unknown ID is rejected with nothing written, and history (run
   list, counts, ledger) is scoped to the selected workspace;

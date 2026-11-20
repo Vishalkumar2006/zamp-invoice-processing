@@ -20,9 +20,11 @@ from ..money import norm_decimal, parse_decimal_amount, parse_money_cents, parse
 
 # ----------------------------------------------------------------------------- geometry
 
-def _norm(text: str) -> str:
+def _norm(text: str, keep_hash: bool = False) -> str:
+    """Lower-case, collapse spaces and drop trailing label punctuation. With keep_hash, a trailing
+    "#" survives ("Invoice #:" -> "invoice #"), because there it is the word that names the field."""
     s = text.lower().replace("–", "-").replace("—", "-")
-    s = re.sub(r"[:#]+$", "", s.strip())
+    s = re.sub(r":+$" if keep_hash else r"[:#]+$", "", s.strip())
     s = re.sub(r"\s+", " ", s)
     return s.strip(" .:")
 
@@ -129,8 +131,10 @@ _CUR = r"(?: \((?P<cur>[a-z]{3})\))?"
 LABELS: dict[str, re.Pattern[str]] = {
     "invoice_number": re.compile(r"^(invoice (number|no\.?|num|#)|inv\.? (no\.?|#)|invoice id)$"),
     "invoice_date": re.compile(r"^(invoice date|date of issue|issue date|date issued|date)$"),
+    # The buyer's own PO, also printed by vendors as "Customer PO", "Client P.O. #", "Your PO no." etc.
     "po_reference": re.compile(
-        r"^(purchase order( (number|no\.?|#|ref(erence)?))?|p\.?o\.?( (number|no\.?|#|ref(erence)?))?)$"),
+        r"^((customer|client|buyer|your) )?"
+        r"(purchase order( (number|no\.?|#|ref(erence)?))?|p\.?o\.?( (number|no\.?|#|ref(erence)?))?)$"),
     "net": re.compile(r"^(sub ?total|net( total| amount)?|total before tax|subtotal \(excl\.? tax\))" + _CUR + "$"),
     "tax": re.compile(r"^((sales )?tax|vat|gst)( \(?[\d.]+ ?%\)?)?" + _CUR + "$"),
     "gross": re.compile(r"^((grand |invoice )?total( due| amount)?|(amount|balance) due)" + _CUR + "$"),
@@ -154,12 +158,14 @@ def _match_label(seg: Segment, include_other: bool = False) -> Optional[tuple[st
         # remainder without one ("TAX INVOICE") means this is not a label.
         if n < len(toks) and not any(ch.isdigit() for t in toks[n:] for ch in t.text):
             continue
-        cand = _norm(" ".join(t.text for t in toks[:n]))
-        compact = cand.replace(" ", "")
-        if include_other and n == len(toks) and (OTHER_LABELS.match(cand) or OTHER_LABELS.match(compact)):
+        text = " ".join(t.text for t in toks[:n])
+        forms = []
+        for f in (_norm(text, keep_hash=True), _norm(text)):
+            forms += [f, f.replace(" ", "")]
+        if include_other and n == len(toks) and any(OTHER_LABELS.match(f) for f in forms):
             return "_other", n, None
         for key, pat in LABELS.items():
-            m = pat.match(cand) or pat.match(compact)
+            m = next((m for f in forms if (m := pat.match(f))), None)
             if m:
                 cur = m.groupdict().get("cur") if "cur" in pat.groupindex else None
                 return key, n, cur.upper() if cur else None
@@ -378,6 +384,16 @@ class InvoiceParser:
         slack = 0.5 * statistics.median(t.h for t in header_row.tokens)
         text_cols = [(c, s) for c, s in cols if c not in NUMERIC_COLS]
 
+        def band_column(tok: Token) -> Optional[str]:
+            """Column whose band - from its header's left edge to the next header's left edge -
+            holds the whole token. Covers a left-aligned header over right-aligned figures that end
+            past the header text, such as a short "Qty" header above a wider quantity column."""
+            for i, (c, s) in enumerate(cols):
+                hi = cols[i + 1][1].x0 - slack if i + 1 < len(cols) else float("inf")
+                if tok.x0 >= s.x0 - slack and tok.x1 <= hi:
+                    return c
+            return None
+
         items: list[dict[str, list[Token]]] = []
         for row in self.rows[header_idx + 1:]:
             if row.page != header_row.page:
@@ -393,6 +409,13 @@ class InvoiceParser:
                             cells.setdefault(c, []).append(tok)
                             placed = True
                             break
+                if not placed and parse_decimal_amount(tok.text) is not None:
+                    # A figure under no header: use the column band. Numbers inside a text column's
+                    # band (dimensions or counts in a description) stay text.
+                    c = band_column(tok)
+                    if c in NUMERIC_COLS:
+                        cells.setdefault(c, []).append(tok)
+                        placed = True
                 if placed:
                     continue
                 # Text column: the right-most text column whose header starts left of the token.
