@@ -150,7 +150,8 @@ supplied sample. They cover:
 - rule boundaries: exactly 1% vs above, net at the cap vs one cent over, quantity at the cap vs one unit over;
 - missing and low-confidence fields;
 - the HTTP flow end to end;
-- finalize retry and concurrent finalize (one allocation);
+- finalize retry and concurrent finalize (one allocation), and two distinct invoices that each fit the fresh PO
+  finalized at the same moment (one `READY`, one `HOLD / AMOUNT_EXCEEDS_PO` citing the winner, one allocation);
 - database uniqueness;
 - restart persistence;
 - cumulative overbilling across two distinct invoices that each fit the fresh PO but together exceed the

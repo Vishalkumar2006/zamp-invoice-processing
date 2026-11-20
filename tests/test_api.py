@@ -144,6 +144,38 @@ def _cal_std_invoice(number: str, qty: int) -> bytes:
                        subtotal=amount, total=amount)
 
 
+def test_race_between_two_distinct_invoices_for_the_same_remaining_authorization(client):
+    """Two invoice numbers that each fit the fresh PO but together exceed it, finalized at the same moment:
+    exactly one is accepted and the other is held for overbilling against the winner's allocation."""
+    _import(client)
+    a = wait_for(client, _upload(client, _cal_std_invoice("HCI-2001", 14), "a.pdf").json()["run_id"])
+    b = wait_for(client, _upload(client, _cal_std_invoice("HCI-2002", 14), "b.pdf").json()["run_id"])
+    assert (a["decision"], b["decision"]) == ("READY", "HOLD")
+    for _trial in range(5):
+        with db() as conn:  # undo both decisions, then let two finalizers race
+            conn.execute("DELETE FROM allocation_lines")
+            conn.execute("DELETE FROM allocations")
+            conn.execute("UPDATE runs SET decision=NULL, decision_json=NULL WHERE id IN (?,?)", (a["run_id"], b["run_id"]))
+        barrier, out = threading.Barrier(2), {}
+
+        def go(run_id):
+            barrier.wait()
+            with db() as conn:
+                out[run_id] = finalize(conn, run_id)
+
+        threads = [threading.Thread(target=go, args=(r["run_id"],)) for r in (a, b)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        assert sorted((o["decision"], o["reason_code"]) for o in out.values()) == [
+            ("HOLD", "AMOUNT_EXCEEDS_PO"), ("READY", "MATCHED_WITHIN_AUTHORIZATION")]
+        winner = next(rid for rid, o in out.items() if o["decision"] == "READY")
+        held = client.get(f"/runs/{next(rid for rid in out if rid != winner)}").json()
+        assert [p["run_id"] for p in held["decision_detail"]["authorization"]["prior_invoices"]] == [winner]
+        ledger = client.get("/ledger").json()
+        po = next(p for p in ledger["purchase_orders"] if p["po_id"] == "PO-7781")
+        assert ledger["allocation_count"] == 1 and po["remaining_net_cents"] == 346000
+
+
 def test_cumulative_overbilling_across_two_invoices(client):
     """Two distinct invoice numbers that each fit the fresh PO but together exceed both the
     quantity cap (24 units of CAL-STD) and the money caps (line 6,000.00; PO total 6,960.00)."""
