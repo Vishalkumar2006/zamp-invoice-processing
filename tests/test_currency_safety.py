@@ -162,3 +162,59 @@ def test_scanned_invoice_with_dollars_is_still_ready(client):
     run, _before, after = _submit(client, scan_pdf(items(before="$")), **USD_DEFAULT)
     assert (run["decision"], after["allocation_count"]) == ("READY", 1)
     assert run["extraction"]["invoice"]["currency"]["value"] == "USD"
+
+
+# --------------------------------------------------------------------------- unidentified marks beside recognised ones
+
+def _assert_unresolved(run, before, after, recognised_kind):
+    """Held for currency review, no currency named, both kinds of marker kept as evidence, nothing allocated."""
+    _held_untouched(run, before, after)
+    d = run["decision_detail"]
+    assert (run["reason_code"], d["review_field"]) == ("MISSING_OR_UNCLEAR_FIELD", "currency")
+    cur = run["extraction"]["invoice"]["currency"]
+    assert cur["value"] is None and cur["source"] is None
+    assert "currency evidence is unresolved" in cur["note"] and "currency evidence is unresolved" in run["reason"]
+    for name in ("GBP", "EUR", "JPY", "INR", "CHF"):
+        assert name not in run["reason"]                     # an unidentified mark is never given a specific currency
+    kinds = {i["kind"] for i in run["extraction"]["invoice"]["currency_indicators"]}
+    assert {"unidentified", recognised_kind} <= kinds
+
+
+@pytest.mark.parametrize("settings", [USD_DEFAULT, {}], ids=["usd_default", "unconfigured"])
+def test_usd_label_with_an_unidentified_mark_beside_amounts_holds(client, settings):            # 1. and 2.
+    run, before, after = _submit(client, make_pdf(items(before="¤ ", label="Amount due (USD)")), **settings)
+    _assert_unresolved(run, before, after, "label_code")
+    if settings:
+        assert "the workspace default USD is not applied" in run["extraction"]["invoice"]["currency"]["note"]
+
+
+def test_dollar_amounts_with_an_unidentified_mark_beside_another_amount_hold(client):         # 3.
+    run, before, after = _submit(client, make_pdf(items(before="$", total="¤ 200.00")), **USD_DEFAULT)
+    _assert_unresolved(run, before, after, "dollar")
+
+
+def test_unidentified_mark_attached_to_an_amount_with_a_usd_code_holds(client):
+    run, before, after = _submit(client, make_pdf(items(before="¤", label="Amount due (USD)")))
+    _assert_unresolved(run, before, after, "label_code")
+
+
+def test_finalize_retries_after_an_unidentified_currency_hold_never_touch_the_ledger(client):  # 9.
+    ws = _import(client, **USD_DEFAULT)
+    before = client.get("/ledger", params={"workspace_id": ws}).json()
+    pdf = make_pdf(items(before="¤ ", label="Amount due (USD)"))
+    rid = client.post("/runs", files={"file": ("i.pdf", pdf, "application/pdf")}, data={"workspace_id": ws}).json()["run_id"]
+    run = wait_for(client, rid)
+    assert (run["decision"], run["reason_code"]) == ("HOLD", "MISSING_OR_UNCLEAR_FIELD")
+    for _ in range(3):
+        r = client.post(f"/runs/{rid}/finalize").json()
+        assert (r["already_finalized"], r["allocations_for_run"]) == (True, 0)
+    assert client.get("/ledger", params={"workspace_id": ws}).json() == before
+    assert client.get(f"/runs/{rid}").json()["allocation_id"] is None
+
+
+@ocr
+def test_scanned_euro_total_beside_dollar_amounts_is_not_read_as_usd(client):
+    # OCR does not recognise the euro sign on the total (it reads a different glyph); the "$" amounts must not decide.
+    run, before, after = _submit(client, scan_pdf(items(before="$", total="€ 200.00")), **USD_DEFAULT)
+    _held_untouched(run, before, after)
+    assert run["extraction"]["invoice"]["currency"]["value"] is None

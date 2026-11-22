@@ -278,7 +278,9 @@ supplied sample. They cover:
 - An invoice with no printed PO goes to `HOLD` with candidate POs. It is never auto-allocated.
 - Currency comes from every marker printed on the document: ISO codes (in labels or beside amounts), symbols
   (`£`, `€`, `¥`, `₹`, prefixed dollars such as `C$`) and a bare `$`, which alone means USD and agrees with any dollar
-  code. Disagreeing markers hold for review; a recognised non-USD currency holds as `UNSUPPORTED_CURRENCY`. A
+  code. Disagreeing markers hold for review, and so does an unrecognised mark printed beside an amount (it may be
+  a currency sign OCR could not read), even next to a recognised marker. A recognised non-USD currency holds as
+  `UNSUPPORTED_CURRENCY`. A
   workspace `default_currency` applies only when no marker is printed at all, and is recorded as such.
 - A held or blocked run contributes zero to PO balances.
 - Each CSV import creates a new workspace. This isolates test scenarios. Browser uploads go to the workspace shown
