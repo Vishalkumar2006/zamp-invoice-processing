@@ -188,7 +188,7 @@ def test_suggestion_from_line_evidence_with_an_equal_total_alternative(client):
     assert not alt["viable"] and not any(r["mapped"] for r in alt["lines"])
     assert "PO-8102 has the same total (USD 400.00) but is not eligible" in run["reason"]
     assert "the invoice does not name stainless" in run["reason"] and "PO specification 20, m8 not on the invoice" in run["reason"]
-    assert "NH-55A as SC-516" in d["next_action"]
+    assert "NH-55A -> SC-516" in d["next_action"] and "not approved cross-references" in d["next_action"]
     assert client.post(f"/runs/{run['run_id']}/finalize").json()["allocations_for_run"] == 0
     assert _ledger(client, ws) == before
 

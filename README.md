@@ -29,6 +29,7 @@ curl http://localhost:8000/health
 Data (SQLite database and original PDFs) lives in the `zamp_data` Docker volume at `/data`, so it survives
 `docker compose restart` and `docker compose down`/`up`. Run `docker compose down -v` for a clean database.
 To require HTTP basic auth, set `APP_PASSWORD` (and optionally `APP_USERNAME`, default `ap`).
+For hosting (one instance, persistent `/data` volume, HTTPS, auth), see [DEPLOYMENT.md](DEPLOYMENT.md).
 
 In the UI:
 
@@ -275,8 +276,10 @@ supplied sample. They cover:
 - One invoice per PDF, one PO per invoice, USD only, explicit line amounts, lines matched by SKU (or, for a
   missing-PO suggestion only, by product identity and specifications).
 - An invoice with no printed PO goes to `HOLD` with candidate POs. It is never auto-allocated.
-- If no ISO code is printed, a `$` sign is read as USD. The note is kept on the currency field. With no marker at
-  all, only a workspace `default_currency` supplies one.
+- Currency comes from every marker printed on the document: ISO codes (in labels or beside amounts), symbols
+  (`£`, `€`, `¥`, `₹`, prefixed dollars such as `C$`) and a bare `$`, which alone means USD and agrees with any dollar
+  code. Disagreeing markers hold for review; a recognised non-USD currency holds as `UNSUPPORTED_CURRENCY`. A
+  workspace `default_currency` applies only when no marker is printed at all, and is recorded as such.
 - A held or blocked run contributes zero to PO balances.
 - Each CSV import creates a new workspace. This isolates test scenarios. Browser uploads go to the workspace shown
   on the upload page; API uploads without `workspace_id` go to the latest workspace.

@@ -93,6 +93,8 @@ class ExtractedInvoice(BaseModel):
     # An explicit notice that remittance details changed ("updated remittance details", "we have moved our banking").
     remittance_notice: Field_ = Field(default_factory=Field_)
     currency: Field_ = Field(default_factory=Field_)
+    # Every currency marker found on the document (currency, kind, printed text, page, bbox, conf), kept as evidence.
+    currency_indicators: list[dict[str, Any]] = Field(default_factory=list)
     net: Field_ = Field(default_factory=Field_)  # cents
     tax: Field_ = Field(default_factory=Field_)  # cents
     gross: Field_ = Field(default_factory=Field_)  # cents

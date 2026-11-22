@@ -334,7 +334,7 @@ function renderEvidence(x) {
     if (f.value === null || f.value === undefined) return `<span class="muted">${esc(f.note || "—")}</span>`;
     const shown = ["net", "tax", "gross", "freight"].includes(k) ? money(f.value, cur) : esc(f.value);
     // Values resolved from the workspace configuration (default currency, numeric date order) say so.
-    return f.source === "workspace_config" || (f.note && k === "invoice_date")
+    return f.source === "workspace_config" || (f.note && (k === "invoice_date" || k === "currency"))
       ? `${shown}<br><span class="muted">${esc(f.note || "from the workspace configuration")}</span>` : shown;
   };
   const pages = x.pages.map((p) => {
@@ -351,6 +351,8 @@ function renderEvidence(x) {
     <h3 style="font-size:13px;margin:12px 0 4px">Line items</h3>
     <table><thead><tr><th>SKU</th><th>Description</th><th class="num">Qty</th><th class="num">Unit price</th><th class="num">Amount</th></tr></thead>
     <tbody>${lrows}</tbody></table>
+    ${(inv.currency_indicators || []).length ? `<p class="muted">Currency markers printed: ${esc([...new Set(inv.currency_indicators
+      .map((c) => `${c.text} → ${c.currency === "$" ? "$ (dollar)" : c.currency} (p${c.page}, ${c.kind})`))].slice(0, 8).join("; "))}</p>` : ""}
     ${inv.issues.length ? `<p class="warn">Issues: ${esc(inv.issues.join("; "))}</p>` : ""}`;
 }
 

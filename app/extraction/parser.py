@@ -242,6 +242,17 @@ def parse_period(text: str) -> tuple[Optional[str], Optional[str]]:
     return None, "unrecognised period format"
 
 
+# Currency markers. Recognised so a printed currency is never mistaken for a missing one; which currencies the
+# rules accept is decided there (SUPPORTED_CURRENCIES), not here.
+_ISO_CURRENCIES = {"USD", "EUR", "GBP", "CAD", "AUD", "NZD", "INR", "JPY", "CNY", "CHF", "HKD", "SGD", "SEK", "NOK",
+                   "DKK", "MXN", "BRL", "ZAR", "KRW", "PLN", "AED", "SAR", "TRY", "ILS", "PHP", "THB", "IDR", "MYR"}
+_CURRENCY_SYMBOLS = {"£": "GBP", "€": "EUR", "¥": "JPY", "₹": "INR", "₩": "KRW", "₽": "RUB", "₺": "TRY", "₪": "ILS",
+                     "₱": "PHP", "฿": "THB", "₫": "VND", "₦": "NGN", "₴": "UAH", "₲": "PYG", "₡": "CRC"}
+_PREFIXED_DOLLARS = {"US$": "USD", "C$": "CAD", "CA$": "CAD", "A$": "AUD", "AU$": "AUD", "NZ$": "NZD", "HK$": "HKD",
+                     "S$": "SGD", "SG$": "SGD", "MX$": "MXN", "R$": "BRL"}
+_DOLLAR_CURRENCIES = {"USD", "CAD", "AUD", "NZD", "HKD", "SGD", "MXN"}  # currencies printed with a bare "$"
+
+
 # Printed wording that states no tax is charged. Read as zero only when subtotal equals total.
 _NO_TAX = re.compile(r"^(not applicable|n/?a|none|nil|exempt|tax exempt|not taxable|no tax|zero rated)$")
 
@@ -391,29 +402,72 @@ class InvoiceParser:
         best = max(cands, key=lambda s: (round(s.height, 0), -s.tokens[0].y0))
         self.inv.supplier_name = Field_(raw=best.text, value=best.text.strip(), evidence=evidence_for(best.tokens))
 
-    def _currency(self, labelled) -> None:
-        codes: dict[str, list[Token]] = {}
-        for key in ("gross", "net", "tax"):
+    def _currency_indicators(self, labelled) -> list[tuple[str, str, str, list[Token]]]:
+        """Every currency marker printed on the document: (currency or "$", kind, printed text, tokens).
+        Kinds: "label_code" ("Total (EUR)"), "code" (a recognised ISO code token, alone or fixed to an amount),
+        "symbol" (£, €, ¥, ₹, … or a prefixed dollar such as C$), "dollar" (a bare "$", which any dollar currency
+        uses). Nothing is dropped: resolution decides from all of them together."""
+        found: list[tuple[str, str, str, list[Token]]] = []
+        for key in ("gross", "net", "tax", "freight"):
             for _toks, label_toks, cur in labelled.get(key, []):
                 if cur:
-                    codes.setdefault(cur, label_toks)
-        if not codes:
-            for t in self.tokens:
-                m = re.fullmatch(r"\(?(USD|EUR|GBP|CAD|AUD|INR)\)?[.,:]?", t.text)
-                if m:
-                    codes.setdefault(m.group(1), [t])
-        if len(codes) > 1:
-            self.inv.currency.note = "conflicting currency codes: " + ", ".join(sorted(codes))
+                    found.append((cur, "label_code", " ".join(t.text for t in label_toks), label_toks))
+        for t in self.tokens:
+            s = t.text.strip("()[]{}.,:;")
+            m = re.fullmatch(r"([A-Z]{3})", s) or re.fullmatch(r"([A-Z]{3})\d[\d,.]*", s) or \
+                re.fullmatch(r"[-+]?\d[\d,.]*([A-Z]{3})", s)
+            if m and m.group(1) in _ISO_CURRENCIES:
+                found.append((m.group(1), "code", t.text, [t]))
+                continue
+            m = re.match(r"^[(\-+]?([A-Z]{1,3})\$", s)
+            if m and m.group(1) + "$" in _PREFIXED_DOLLARS:
+                found.append((_PREFIXED_DOLLARS[m.group(1) + "$"], "symbol", t.text, [t]))
+                continue
+            for ch in t.text:
+                if ch in _CURRENCY_SYMBOLS:
+                    found.append((_CURRENCY_SYMBOLS[ch], "symbol", t.text, [t]))
+                    break
+            else:
+                if "$" in t.text and not re.search(r"[A-Za-z]\$", t.text):
+                    found.append(("$", "dollar", t.text, [t]))
+        return found
+
+    def _currency(self, labelled) -> None:
+        """Currency from the document's own markers; the workspace default only when none is printed.
+
+        Specific markers (ISO codes, £/€/¥/₹…, prefixed dollars) must agree. A bare "$" agrees with any dollar
+        currency and alone means USD. Disagreeing markers leave the currency empty for review: one is never
+        chosen over another, and a printed marker is never replaced by the workspace default."""
+        indicators = self._currency_indicators(labelled)
+        self.inv.currency_indicators = [
+            {"currency": c, "kind": k, "text": text, "page": toks[0].page, "conf": evidence_for(toks).conf,
+             "bbox": evidence_for(toks).bbox} for c, k, text, toks in indicators]
+        specific: dict[str, list[tuple[str, str, list[Token]]]] = {}
+        for c, k, text, toks in indicators:
+            if c != "$":
+                specific.setdefault(c, []).append((k, text, toks))
+        dollars = [(text, toks) for c, k, text, toks in indicators if c == "$"]
+        default = self.settings.get("default_currency")
+        conflict = len(specific) > 1 or (len(specific) == 1 and dollars and next(iter(specific)) not in _DOLLAR_CURRENCIES)
+        if conflict:
+            shown = sorted({f"{c} ({items[0][1]})" for c, items in specific.items()} | ({"$"} if dollars else set()))
+            self.inv.currency = Field_(raw=" / ".join(shown), evidence=evidence_for(indicators[0][3]),
+                                       note="conflicting currency indicators: " + ", ".join(shown)
+                                            + (f"; the workspace default {default} is not applied" if default else ""))
             self.inv.issues.append(f"currency: {self.inv.currency.note}")
             return
-        if codes:
-            code, toks = next(iter(codes.items()))
-            self.inv.currency = Field_(raw=code, value=code, evidence=evidence_for(toks))
-            return
-        dollar = [t for t in self.tokens if t.text.startswith("$")]
-        default = self.settings.get("default_currency")
-        if dollar:
-            self.inv.currency = Field_(raw="$", value="USD", evidence=evidence_for([dollar[0]]),
+        if specific:
+            code, items = next(iter(specific.items()))
+            k, text, toks = next((i for i in items if i[0] != "symbol"), items[0])  # a code's position, if printed
+            note = None
+            if k == "symbol":
+                note = f"read from the {text!r} marker; no ISO code printed"
+            if dollars:
+                note = ((note + "; ") if note else "") + f"'$' is consistent with {code}"
+            self.inv.currency = Field_(raw=code if k != "symbol" else text, value=code,
+                                       evidence=evidence_for(toks), note=note)
+        elif dollars:
+            self.inv.currency = Field_(raw="$", value="USD", evidence=evidence_for(dollars[0][1]),
                                        note="inferred from '$' symbol; no ISO code printed")
         elif default:
             # No marker on the document: the workspace's configured default applies, recorded as such.

@@ -126,6 +126,17 @@ def evaluate(inv: ExtractedInvoice, snap: Snapshot, *, min_conf: float, policy_v
 
 # ----------------------------------------------------------------------------- rules
 
+def _unsupported_currency(inv: ExtractedInvoice, check) -> None:
+    c = inv.currency
+    where = (f" (printed as {c.raw!r}, page {c.evidence.page})" if c.evidence is not None and c.source is None
+             else " (from the workspace configuration)" if c.source == "workspace_config" else "")
+    check("evidence", False, f"unsupported currency {c.value}{where}", currency=c.value, raw=c.raw)
+    raise _Stop("HOLD", "UNSUPPORTED_CURRENCY",
+                f"Currency {c.value} is not supported{where}. Only {', '.join(sorted(SUPPORTED_CURRENCIES))} invoices "
+                f"are processed; amounts are never converted or re-read as another currency.",
+                "Route to manual processing. Nothing is allocated.", review_field="currency")
+
+
 def _evidence(inv: ExtractedInvoice, min_conf: float, check) -> None:
     critical: list[tuple[str, Field_]] = [
         ("supplier_name", inv.supplier_name), ("invoice_number", inv.invoice_number),
@@ -157,6 +168,10 @@ def _evidence(inv: ExtractedInvoice, min_conf: float, check) -> None:
             raise _Stop("HOLD", "LOW_CONFIDENCE_FIELD",
                         f"'{name}' was read as {f.raw!r} with OCR confidence {f.evidence.conf} (minimum {min_conf}).",
                         f"Confirm '{name}' against the PDF.", review_field=name)
+        if name == "currency" and f.value not in SUPPORTED_CURRENCIES:
+            # A verified printed currency the process does not handle decides here, before amounts that may not
+            # parse in that currency's format; it is never converted or replaced by a default.
+            _unsupported_currency(inv, check)
     if inv.tax.value is None and inv.net.value != inv.gross.value:
         check("evidence", False, "tax not printed and net != gross", net=inv.net.value, gross=inv.gross.value)
         raise _Stop("HOLD", "MISSING_OR_UNCLEAR_FIELD", "Tax is not printed and net differs from gross.",
@@ -170,9 +185,7 @@ def _evidence(inv: ExtractedInvoice, min_conf: float, check) -> None:
         raise _Stop("HOLD", "EXTRACTION_ISSUE", "Extraction found ambiguity: " + "; ".join(inv.issues),
                     "Review the flagged fields on the PDF.", review_field=inv.issues[0].split(":")[0])
     if inv.currency.value not in SUPPORTED_CURRENCIES:
-        check("evidence", False, f"unsupported currency {inv.currency.value}", currency=inv.currency.value)
-        raise _Stop("HOLD", "UNSUPPORTED_CURRENCY", f"Currency {inv.currency.value} is not supported.",
-                    "Route to manual processing.", review_field="currency")
+        _unsupported_currency(inv, check)
     configured = [n for n, f in critical if f.source == "workspace_config"]
     check("evidence", True, f"{len(critical)} critical values found with confidence >= {min_conf}"
           + (f" ({', '.join(configured)} from the workspace configuration)" if configured else ""),
@@ -985,8 +998,15 @@ def _missing_po(inv, snap: Snapshot, vendor, check, ctx) -> None:
                     f"are not PO SKUs; by line evidence one open PO fits, {viable[0]}: {support}. "
                     + (". ".join(ruled_out) + ". " if ruled_out else "")
                     + "A missing PO is never assigned automatically; nothing is allocated.",
-                    f"Ask procurement to confirm that {viable[0]} covers {dn_text} (suggested from line evidence: "
-                    f"{', '.join(r['sku'] + ' as ' + r['po_sku'] for r in by_product)}), then re-submit with the PO.",
+                    f"Do not allocate or pay yet. Ask procurement to confirm both that {viable[0]} covers {dn_text} and "
+                    f"that the proposed line mappings are correct: "
+                    f"{', '.join(r['sku'] + ' -> ' + r['po_sku'] for r in by_product)}. These mappings are inferred "
+                    f"from descriptions and specifications; they are suggestions, not approved cross-references. "
+                    f"Adding only the PO number will not clear the hold: a printed PO is validated by SKU, and this "
+                    f"process cannot approve or override a vendor part number that differs from the PO SKU. Once "
+                    f"procurement confirms, obtain a corrected invoice from the vendor that prints {viable[0]} and the "
+                    f"PO SKUs, or route the part-number discrepancy for manual resolution. Nothing is allocated while "
+                    f"confirmation is outstanding.",
                     review_field="po_reference")
     why = "; ".join(f"{c['po_id']}: {', '.join(c['failures'])}" for c in cands) or "the vendor has no POs"
     raise _Stop("HOLD", "PO_MISSING_NO_MATCH",

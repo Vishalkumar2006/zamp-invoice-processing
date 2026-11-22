@@ -22,7 +22,7 @@ def make_pdf(items: list[Text], width: float = 612, height: float = 792) -> byte
     for it in items:
         font = "/F2" if it.bold else "/F1"
         ops.append(f"BT {font} {it.size} Tf {it.x:.2f} {height - it.y - it.size:.2f} Td ({_esc(it.text)}) Tj ET")
-    stream = "\n".join(ops).encode("latin-1")
+    stream = "\n".join(ops).encode("cp1252")  # WinAnsiEncoding: also covers "€" (0x80), "£" and "¥"
     objs = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
