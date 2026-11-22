@@ -107,3 +107,44 @@ def test_pages_use_only_local_assets(client):
     js = client.get("/static/app.js").text
     for fn in ("function initShell", "function initHome", "function initRun", "function initHistory"):
         assert fn in js
+
+
+DEV_ONLY = ("API reference", 'href="/docs"', "OCR engine", "sys-policy", "ps1-policy", "/health")
+NEVER = ("payment approved", "payment completed", "automatically paid", ">paid<")
+
+
+def test_customer_pages_hide_developer_navigation_and_status(client):
+    from app import config
+    pages = {"home (empty)": client.get("/").text}
+    ws = _import(client)
+    run = _run(client, ws, invoice_pdf())
+    pages["home"] = client.get("/").text
+    pages["history"] = client.get("/ui/history", params={"workspace_id": ws}).text
+    pages["run"] = client.get(f"/ui/runs/{run['run_id']}").text
+    js = client.get("/static/app.js").text
+    for name, page in pages.items():
+        for marker in DEV_ONLY + (config.POLICY_VERSION,):
+            assert marker not in page, (name, marker)
+        assert "Invoice Operations" in page and "Accounts payable workspace" in page, name
+        nav = re.search(r'<nav class="nav"[^>]*>(.*?)</nav>', page, re.S).group(1)
+        assert re.findall(r'<a href="([^"]+)"', nav) == ["/", "/ui/history"], name
+        for phrase in NEVER:
+            assert phrase not in page.lower(), (name, phrase)
+    assert '"/health"' not in js and "/docs" not in js
+    for phrase in NEVER:
+        assert phrase not in js.lower(), phrase
+    # The routes themselves remain available; they are just not part of the customer UI.
+    assert client.get("/health").status_code == 200 and client.get("/docs").status_code == 200
+
+
+def test_run_page_keeps_audit_detail_available(client):
+    ws = _import(client)
+    run = _run(client, ws, invoice_pdf())
+    page = client.get(f"/ui/runs/{run['run_id']}").text
+    for tab in ("tab-checks", "tab-evidence", "tab-lines", "tab-events", "tab-audit"):
+        assert f'id="{tab}"' in page, tab
+    assert 'id="audit"' in page and "Audit details" in page and "Validation checks" in page
+    js = client.get("/static/app.js").text
+    for needed in ("Rules policy version", "Reason codes", "File fingerprint (SHA-256)", "renderCandidates", "renderPrices",
+                   "renderDuplicate", "renderRemittance", "renderAuthorization", "Show full reason"):
+        assert needed in js, needed

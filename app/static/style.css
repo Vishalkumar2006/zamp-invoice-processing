@@ -78,7 +78,7 @@ p { margin: 0 0 8px; }
 .brand-mark .icon { width: 19px; height: 19px; stroke: #fff; stroke-width: 2; }
 .brand-text { display: flex; flex-direction: column; line-height: 1.2; }
 .brand-text strong { font-size: 14.5px; font-weight: 650; letter-spacing: -.01em; }
-.brand-text small { font-size: 11.5px; color: var(--nav-muted); margin-top: 2px; }
+.brand-text small { font-size: 11px; color: var(--nav-muted); margin-top: 2px; white-space: nowrap; }
 .nav-label { font-size: 10.5px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase;
   color: var(--nav-muted); padding: 10px 10px 6px; }
 .nav { display: flex; flex-direction: column; gap: 2px; }
@@ -89,15 +89,17 @@ p { margin: 0 0 8px; }
 .nav a.active::before { content: ""; position: absolute; left: -14px; top: 8px; bottom: 8px; width: 3px;
   border-radius: 0 3px 3px 0; background: #5b8cff; }
 .nav a .icon { opacity: .9; }
-.nav a .ext { margin-left: auto; opacity: .55; width: 14px; height: 14px; }
-.sidebar-foot { margin-top: auto; padding: 12px 10px 2px; border-top: 1px solid rgba(255,255,255,.07);
-  font-size: 12px; color: var(--nav-muted); display: grid; gap: 6px; }
-.sys-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.sys-row span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sys-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--nav-muted); flex: none; }
-.sys-dot.ok { background: #32d583; box-shadow: 0 0 0 3px rgba(50,213,131,.15); }
-.sys-dot.bad { background: #f97066; }
-.sidebar-foot code { color: #d4dbea; font-size: 11px; }
+.sidebar-foot { margin-top: auto; padding: 14px 4px 2px; }
+.ws-card { display: grid; gap: 4px; padding: 13px 14px; border-radius: 10px; background: rgba(255,255,255,.045);
+  border: 1px solid rgba(255,255,255,.08); font-size: 12px; color: var(--nav-muted); min-width: 0; }
+.ws-card-label { display: flex; align-items: center; gap: 7px; font-size: 10.5px; font-weight: 600; letter-spacing: .08em;
+  text-transform: uppercase; color: var(--nav-muted); }
+.ws-card-label .icon { color: #7ea3ff; }
+.ws-card-id { color: #e6ebf5; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
+.ws-card-empty { color: #d4dbea; font-size: 12.5px; }
+.ws-card-note { color: var(--nav-text); }
+.ws-card-link { color: #9db8ff; font-weight: 600; margin-top: 4px; }
+.ws-card-link:hover { color: #c3d3ff; }
 
 .main-col { min-width: 0; display: flex; flex-direction: column; }
 .topbar {
@@ -317,7 +319,7 @@ a.cell-main:hover { color: var(--primary); }
 .cell-sub { display: block; font-size: 12px; color: var(--text-3); margin-top: 1px; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .money { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .money .cur { color: var(--text-3); font-size: .92em; margin-right: 3px; }
-.reason-cell { max-width: 320px; }
+.reason-cell { max-width: 290px; }
 .reason-cell .reason-text { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
   font-size: 12px; color: var(--text-3); margin-top: 3px; }
 .view-link { display: inline-flex; align-items: center; gap: 4px; font-weight: 600; font-size: 12.5px; white-space: nowrap; }
@@ -420,7 +422,7 @@ table.cands td.bad { background: #fff6ed; }
 .next-action .icon { color: var(--primary); margin-top: 2px; }
 .next-action .na-label { font-size: 11.5px; font-weight: 650; letter-spacing: .06em; text-transform: uppercase; color: var(--primary); }
 .next-action p { margin: 3px 0 0; color: #172554; font-weight: 550; line-height: 1.55; }
-.facts { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 0; margin: 0; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; font-size: 13px; }
+.facts { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 0; margin: 0; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; font-size: 13px; }
 .facts dt, .facts dd { padding: 9px 12px; border-bottom: 1px solid var(--border); margin: 0; }
 .facts dt { background: var(--surface-2); color: var(--text-3); font-weight: 550; }
 .facts dd { overflow-wrap: anywhere; }
@@ -545,7 +547,7 @@ h2 .muted { font-weight: 500; font-size: 13px; }
   .sidebar { position: static; height: auto; flex-direction: row; align-items: center; flex-wrap: wrap; gap: 4px 12px; padding: 10px 16px; }
   .brand { padding: 2px 0; }
   .brand-text small { display: none; }
-  .nav-label, .sidebar-foot, .nav .nav-ext { display: none; }
+  .nav-label, .sidebar-foot { display: none; }
   .nav { flex-direction: row; margin-left: auto; }
   .nav a { padding: 7px 10px; font-size: 13px; }
   .nav a.active::before { display: none; }
@@ -594,3 +596,20 @@ h2 .muted { font-weight: 500; font-size: 13px; }
   .sidebar, .topbar, .pdf-card { display: none; }
   .shell { display: block; }
 }
+
+/* customer-facing labels */
+.reason-label { display: inline-flex; align-items: center; height: 24px; padding: 0 9px; border-radius: 6px; font-size: 12px;
+  font-weight: 600; color: var(--text-2); background: var(--surface-3); border: 1px solid var(--border); white-space: nowrap; }
+.reason-cell .reason-label { margin-left: 4px; }
+.decision-codes .reason-label { background: rgba(255,255,255,.7); }
+.reason-block { margin: 0 0 16px; }
+.muted-label { color: var(--text-3); margin-bottom: 4px; font-size: 11.5px; font-weight: 650; letter-spacing: .06em; text-transform: uppercase; }
+.decision-reason { margin-bottom: 6px; }
+.decision-reason.clamped { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.link-btn { appearance: none; border: 0; background: none; padding: 2px 0; font: 600 13px var(--font); color: var(--primary);
+  cursor: pointer; display: inline-flex; align-items: center; gap: 4px; }
+.link-btn:hover { color: var(--primary-hover); text-decoration: underline; text-underline-offset: 2px; }
+.link-btn .icon { transition: transform .2s; }
+.link-btn[aria-expanded="true"] .icon { transform: rotate(180deg); }
+.rule-label { font-weight: 600; color: var(--text-2); white-space: nowrap; font-size: 12.5px; }
+.facts dt { overflow-wrap: break-word; }

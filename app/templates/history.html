@@ -2,16 +2,30 @@
 {% block title %}History & Ledger{% endblock %}
 {% block crumbs %}<a href="/">Invoice Operations</a><span class="sep">/</span><span aria-current="page">History &amp; Ledger</span>{% endblock %}
 {% block context %}{% if workspace_id %}<span class="ws-chip"><svg class="icon"><use href="#i-layers"/></svg>Workspace <code>{{ workspace_id }}</code></span>{% endif %}{% endblock %}
+{% macro reason_label(code) -%}
+  {%- for w in code.split('_') -%}
+    {%- if w in ('PO', 'POS', 'ID', 'SKU') -%}{{ 'POs' if w == 'POS' else w }}{%- elif loop.first -%}{{ w|lower|capitalize }}{%- else -%}{{ w|lower }}{%- endif -%}
+    {{- ' ' if not loop.last -}}
+  {%- endfor -%}
+{%- endmacro %}
+{% block sidebar_ws %}{% if workspace_id %}
+        <div class="ws-card">
+          <span class="ws-card-label"><svg class="icon sm"><use href="#i-layers"/></svg>Viewing workspace</span>
+          <code class="ws-card-id">{{ workspace_id }}</code>
+          {%- for w in workspaces if w.workspace_id == workspace_id %}
+          <span class="ws-card-note">Data loaded {{ w.created_at[:10] }}</span>{% endfor %}
+          <a class="ws-card-link" href="/">Back to dashboard</a>
+        </div>{% else %}{{ super() }}{% endif %}{% endblock %}
 {% block content %}
 {%- set icons = {'READY': 'i-check-circle', 'HOLD': 'i-alert', 'BLOCKED': 'i-block', 'FAILED': 'i-x-circle', 'RUNNING': 'i-clock', 'QUEUED': 'i-clock'} -%}
 <div class="page-head">
   <div>
     <h1>History &amp; Ledger</h1>
     {% if workspace_id %}
-    <p class="lede">Every invoice run and PO allocation in workspace <code id="current-ws">{{ workspace_id }}</code>
+    <p class="lede">Every submitted invoice and purchase order allocation in workspace <code id="current-ws">{{ workspace_id }}</code>
       {%- if workspace_id == latest_workspace_id %} <span class="tag">latest</span>{% endif %}</p>
     {% else %}
-    <p class="lede">Invoice runs and PO allocations, per workspace.</p>
+    <p class="lede">Submitted invoices and purchase order allocations, per workspace.</p>
     {% endif %}
   </div>
   {% if workspaces %}
@@ -20,7 +34,7 @@
     <select name="workspace_id" id="ws-select" onchange="this.form.submit()">
       {% for w in workspaces %}
       <option value="{{ w.workspace_id }}" {% if w.workspace_id == workspace_id %}selected{% endif %}>
-        {{ w.workspace_id }} · imported {{ w.created_at[:16].replace('T', ' ') }} UTC · {{ w.runs }} run{{ '' if w.runs == 1 else 's' }}{% if loop.first %} · latest{% endif %}
+        {{ w.workspace_id }} · loaded {{ w.created_at[:16].replace('T', ' ') }} UTC · {{ w.runs }} invoice{{ '' if w.runs == 1 else 's' }}{% if loop.first %} · latest{% endif %}
       </option>
       {% endfor %}
     </select>
@@ -33,38 +47,38 @@
 <section class="card">
   <div class="empty">
     <span class="empty-icon"><svg class="icon lg"><use href="#i-db"/></svg></span>
-    <h3>No procurement data imported yet</h3>
-    <p>Import vendors, purchase orders and PO lines on the dashboard to create a workspace. Its runs and PO ledger appear here.</p>
+    <h3>No procurement data yet</h3>
+    <p>Set up your vendors, purchase orders and purchase order lines on the dashboard. Submitted invoices and the PO ledger then appear here.</p>
     <p style="margin-top:14px"><a class="btn btn-primary" href="/"><svg class="icon"><use href="#i-grid"/></svg>Go to dashboard</a></p>
   </div>
 </section>
 {% else %}
 {%- set processing = counts.get('RUNNING', 0) + counts.get('QUEUED', 0) -%}
-<section class="kpis" aria-label="Run outcomes">
+<section class="kpis" aria-label="Invoice outcomes">
   <div class="card metric">
-    <div class="metric-top"><span class="metric-label">Total runs</span><span class="metric-icon"><svg class="icon"><use href="#i-receipt"/></svg></span></div>
+    <div class="metric-top"><span class="metric-label">Invoices submitted</span><span class="metric-icon"><svg class="icon"><use href="#i-receipt"/></svg></span></div>
     <div class="metric-value">{{ runs|length }}</div>
     <div class="metric-sub">{% if processing %}{{ processing }} still processing{% else %}in this workspace{% endif %}</div>
   </div>
   <div class="card metric ready">
     <div class="metric-top"><span class="metric-label">Ready</span><span class="metric-icon"><svg class="icon"><use href="#i-check-circle"/></svg></span></div>
     <div class="metric-value">{{ counts.get('READY', 0) }}</div>
-    <div class="metric-sub">validated and allocated</div>
+    <div class="metric-sub">validated and allocated, not yet paid</div>
   </div>
   <div class="card metric hold">
     <div class="metric-top"><span class="metric-label">On hold</span><span class="metric-icon"><svg class="icon"><use href="#i-alert"/></svg></span></div>
     <div class="metric-value">{{ counts.get('HOLD', 0) }}</div>
-    <div class="metric-sub">awaiting AP review</div>
+    <div class="metric-sub">manual review required</div>
   </div>
   <div class="card metric blocked">
     <div class="metric-top"><span class="metric-label">Blocked</span><span class="metric-icon"><svg class="icon"><use href="#i-block"/></svg></span></div>
     <div class="metric-value">{{ counts.get('BLOCKED', 0) }}</div>
-    <div class="metric-sub">must not be processed</div>
+    <div class="metric-sub">cannot proceed, e.g. duplicates</div>
   </div>
   <div class="card metric blocked">
     <div class="metric-top"><span class="metric-label">Failed</span><span class="metric-icon"><svg class="icon"><use href="#i-x-circle"/></svg></span></div>
     <div class="metric-value">{{ counts.get('FAILED', 0) }}</div>
-    <div class="metric-sub">technical errors, retryable</div>
+    <div class="metric-sub">technical problem, can be retried</div>
   </div>
 </section>
 
@@ -97,24 +111,24 @@
 <section class="card" id="runs-card" aria-labelledby="runs-title">
   <div class="card-head">
     <div>
-      <h2 id="runs-title"><svg class="icon"><use href="#i-receipt"/></svg>Invoice runs</h2>
-      <div class="sub-title">Newest first. Open a run for its decision, evidence and original PDF.</div>
+      <h2 id="runs-title"><svg class="icon"><use href="#i-receipt"/></svg>Invoices</h2>
+      <div class="sub-title">Newest first. Open an invoice to see its decision, supporting evidence and the original PDF.</div>
     </div>
   </div>
   {% if runs %}
   <div class="toolbar">
     <div class="search"><svg class="icon"><use href="#i-search"/></svg>
-      <input type="search" id="run-search" placeholder="Search invoice, vendor, PO, reason…" aria-label="Search runs" autocomplete="off"></div>
+      <input type="search" id="run-search" placeholder="Search invoice, vendor, PO, reason…" aria-label="Search invoices" autocomplete="off"></div>
     <div class="filters counts" role="group" aria-label="Filter by outcome">
       <button type="button" class="filter-chip all" data-filter="" aria-pressed="true">All {{ runs|length }}</button>
-      {% for k, v in counts.items() %}<button type="button" class="filter-chip" data-filter="{{ k }}" aria-pressed="false" aria-label="Show only {{ k|lower }} runs ({{ v }})"><span class="pill {{ k|lower }}">{{ k }} {{ v }}</span></button>{% endfor %}
+      {% for k, v in counts.items() %}<button type="button" class="filter-chip" data-filter="{{ k }}" aria-pressed="false" aria-label="Show only {{ k|lower }} invoices ({{ v }})"><span class="pill {{ k|lower }}">{{ k }} {{ v }}</span></button>{% endfor %}
     </div>
-    <span class="result-count" id="run-count" aria-live="polite">{{ runs|length }} run{{ '' if runs|length == 1 else 's' }}</span>
+    <span class="result-count" id="run-count" aria-live="polite">{{ runs|length }} invoice{{ '' if runs|length == 1 else 's' }}</span>
   </div>
   {% endif %}
   <div class="tablewrap">
     <table class="table-lg" id="runs-table">
-      <thead><tr><th class="hide-sm">Submitted (UTC)</th><th>Invoice</th><th class="hide-sm">Vendor</th><th class="hide-sm">Invoice date</th><th>PO</th><th class="num">Amount</th><th>Outcome</th><th class="num hide-sm">Time</th><th><span class="sr-only">Open</span></th></tr></thead>
+      <thead><tr><th class="hide-sm">Submitted (UTC)</th><th>Invoice</th><th class="hide-sm">Vendor</th><th class="hide-sm">Invoice date</th><th>PO</th><th class="num">Amount</th><th>Outcome</th><th class="num hide-sm" title="Processing time">Duration</th><th><span class="sr-only">Open</span></th></tr></thead>
       <tbody>
       {% for r in runs %}
       {%- set outcome = r.decision or r.status -%}
@@ -131,21 +145,21 @@
           <td class="reason-cell">
             {% if r.decision %}<span class="badge {{ r.decision|lower }}"><svg class="icon"><use href="#{{ icons.get(r.decision, 'i-info') }}"/></svg>{{ r.decision }}</span>
             {% elif r.status == 'FAILED' %}<span class="badge failed"><svg class="icon"><use href="#i-x-circle"/></svg>FAILED</span>
-            {% else %}<span class="badge running"><span class="spinner"></span>{{ 'Queued' if r.status == 'QUEUED' else 'Processing' }}</span>{% endif %}
-            {% if r.reason_code %}<span class="code-chip" style="margin-left:4px">{{ r.reason_code }}</span>{% endif %}
+            {% else %}<span class="badge running"><span class="spinner"></span>{{ 'Waiting' if r.status == 'QUEUED' else 'Processing' }}</span>{% endif %}
+            {% if r.reason_code %}<span class="reason-label" title="Reason code {{ r.reason_code }}">{{ reason_label(r.reason_code) }}</span>{% endif %}
             {% if r.reason %}<span class="reason-text" title="{{ r.reason }}">{{ r.reason }}</span>{% endif %}
           </td>
           <td class="num muted hide-sm">{{ '%.1f s'|format(r.processing_ms/1000) if r.processing_ms is not none else '' }}</td>
-          <td class="num"><a class="view-link" href="/ui/runs/{{ r.run_id }}" aria-label="Open run {{ r.run_id }}">View<svg class="icon sm"><use href="#i-arrow-right"/></svg></a></td>
+          <td class="num"><a class="view-link" href="/ui/runs/{{ r.run_id }}" aria-label="Open invoice details ({{ r.run_id }})">View<svg class="icon sm"><use href="#i-arrow-right"/></svg></a></td>
         </tr>
       {% else %}
         <tr><td colspan="9"><div class="empty">
           <span class="empty-icon"><svg class="icon lg"><use href="#i-receipt"/></svg></span>
-          <h3>No runs in this workspace yet</h3>
-          <p>Submit an invoice PDF from the dashboard. Its decision and any allocation will be listed here.</p>
+          <h3>No invoices in this workspace yet</h3>
+          <p>Submit an invoice PDF from the dashboard. Its decision and any allocation are listed here.</p>
         </div></td></tr>
       {% endfor %}
-      {% if runs %}<tr id="runs-nomatch" hidden><td colspan="9"><div class="empty"><h3>No runs match these filters</h3><p>Clear the search or choose “All”.</p></div></td></tr>{% endif %}
+      {% if runs %}<tr id="runs-nomatch" hidden><td colspan="9"><div class="empty"><h3>No invoices match these filters</h3><p>Clear the search or choose “All”.</p></div></td></tr>{% endif %}
       </tbody>
     </table>
   </div>
@@ -156,12 +170,12 @@
   <div class="card-head">
     <div>
       <h2 id="ledger-title">PO ledger <span class="muted">(workspace {{ ledger.workspace_id }})</span></h2>
-      <div class="sub-title">Live authorization balance per purchase order, in exact cents.</div>
+      <div class="sub-title">Current authorization balance for each purchase order.</div>
     </div>
   </div>
   <div class="ledger-note"><svg class="icon"><use href="#i-info"/></svg>
     <span>A <strong>READY</strong> invoice allocates its pre-tax net amount to its PO and reduces <em>Remaining</em>.
-      Held, blocked and failed runs record no allocation, so the PO balance is unchanged. An allocation reserves PO
+      Invoices on hold, blocked or failed have no allocation, so the PO balance is unchanged. An allocation reserves PO
       authorization; it is not a payment.</span></div>
   <div class="tablewrap">
     <table class="table-lg">

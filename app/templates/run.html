@@ -1,17 +1,23 @@
 {% extends "base.html" %}
-{% block title %}Invoice run {{ run_id }}{% endblock %}
+{% block title %}Invoice details{% endblock %}
 {% block crumbs %}<a href="/">Dashboard</a><span class="sep">/</span><a href="/ui/history?workspace_id={{ workspace_id|urlencode }}">History</a><span class="sep">/</span><span aria-current="page" id="crumb-current">{{ run_id }}</span>{% endblock %}
 {% block context %}<a class="ws-chip" href="/ui/history?workspace_id={{ workspace_id|urlencode }}" title="History and ledger for this run's workspace">
   <svg class="icon"><use href="#i-layers"/></svg>Workspace <code>{{ workspace_id }}</code></a>{% endblock %}
+{% block sidebar_ws %}
+        <div class="ws-card">
+          <span class="ws-card-label"><svg class="icon sm"><use href="#i-layers"/></svg>Invoice workspace</span>
+          <code class="ws-card-id">{{ workspace_id }}</code>
+          <a class="ws-card-link" href="/ui/history?workspace_id={{ workspace_id|urlencode }}">View history &amp; ledger</a>
+        </div>{% endblock %}
 {% block content %}
 <div class="run-head">
   <div style="min-width:0">
-    <h1 id="run-title">Invoice run</h1>
+    <h1 id="run-title">Invoice</h1>
     <div class="run-meta">
       <span id="meta-file"><svg class="icon"><use href="#i-file"/></svg><span class="skeleton" style="width:160px"></span></span>
-      <span><svg class="icon"><use href="#i-receipt"/></svg>Run <code>{{ run_id }}</code></span>
+      <span title="Reference for this processing attempt"><svg class="icon"><use href="#i-receipt"/></svg>Processing reference <code>{{ run_id }}</code></span>
       <span id="meta-po" hidden></span>
-      <a href="/ui/history?workspace_id={{ workspace_id|urlencode }}"><svg class="icon"><use href="#i-ledger"/></svg>History and ledger for workspace <code>{{ workspace_id }}</code></a>
+      <a href="/ui/history?workspace_id={{ workspace_id|urlencode }}"><svg class="icon"><use href="#i-ledger"/></svg>History &amp; ledger for workspace <code>{{ workspace_id }}</code></a>
     </div>
   </div>
   <div class="run-status">
@@ -23,10 +29,10 @@
 <section class="card timeline-card" aria-labelledby="timeline-title">
   <div class="card-head">
     <h2 id="timeline-title"><svg class="icon"><use href="#i-hourglass"/></svg>Processing timeline</h2>
-    <span class="sub-title">Recorded run events, updated live</span>
+    <span class="sub-title">Updates live as each step completes</span>
   </div>
   <ol class="steps" id="stages" aria-label="Processing stages"></ol>
-  <div class="live-line" id="live-line" role="status" aria-live="polite"><span class="spinner"></span><span>Loading run…</span></div>
+  <div class="live-line" id="live-line" role="status" aria-live="polite"><span class="spinner"></span><span>Loading…</span></div>
 </section>
 
 <div class="run-split">
@@ -38,7 +44,7 @@
           <div>
             <div class="decision-eyebrow">Decision</div>
             <h2 class="decision-title" id="decision-heading">Awaiting decision</h2>
-            <p class="muted" style="margin:6px 0 0">The outcome appears here once extraction and the vendor, PO and rule checks finish.</p>
+            <p class="muted" style="margin:6px 0 0">The outcome appears here as soon as the invoice has been read and validated.</p>
           </div>
         </div>
       </div>
@@ -46,7 +52,7 @@
 
     <section class="card" id="balance-card" hidden aria-labelledby="balance-title">
       <div class="card-head">
-        <h2 id="balance-title"><svg class="icon"><use href="#i-scale"/></svg>Financial validation</h2>
+        <h2 id="balance-title"><svg class="icon"><use href="#i-scale"/></svg>Financial impact</h2>
         <span class="sub-title" id="balance-sub"></span>
       </div>
       <div class="card-body" id="balance"></div>
@@ -54,7 +60,7 @@
 
     <section class="card" id="fields-card" hidden aria-labelledby="fields-title">
       <div class="card-head">
-        <h2 id="fields-title"><svg class="icon"><use href="#i-scan"/></svg>Extracted invoice data</h2>
+        <h2 id="fields-title"><svg class="icon"><use href="#i-scan"/></svg>Invoice details</h2>
         <span class="sub-title" id="fields-sub"></span>
       </div>
       <div class="card-body" id="fields"></div>
@@ -72,23 +78,25 @@
 
 <section class="card" id="evidence-detail-card" hidden aria-labelledby="evidence-detail-title" style="margin-top:20px">
   <div class="card-head">
-    <h2 id="evidence-detail-title"><svg class="icon"><use href="#i-search"/></svg>Decision evidence</h2>
-    <span class="sub-title">Comparisons recorded with the decision, and the live PO lines</span>
+    <h2 id="evidence-detail-title"><svg class="icon"><use href="#i-search"/></svg>Supporting evidence</h2>
+    <span class="sub-title">Comparisons recorded when the decision was made, and the current PO lines</span>
   </div>
   <div class="card-body" id="evidence-detail"></div>
 </section>
 
-<section class="card" style="margin-top:20px" aria-label="Audit detail">
-  <div class="tabs" role="tablist" aria-label="Audit detail">
-    <button type="button" role="tab" id="tab-checks" aria-controls="checks-card" aria-selected="true">Rule checks <span class="count" id="count-checks">0</span></button>
-    <button type="button" role="tab" id="tab-evidence" aria-controls="evidence-card" aria-selected="false" tabindex="-1">Field sources</button>
+<section class="card" style="margin-top:20px" aria-label="Validation and audit detail">
+  <div class="tabs" role="tablist" aria-label="Validation and audit detail">
+    <button type="button" role="tab" id="tab-checks" aria-controls="checks-card" aria-selected="true">Validation checks <span class="count" id="count-checks">0</span></button>
+    <button type="button" role="tab" id="tab-evidence" aria-controls="evidence-card" aria-selected="false" tabindex="-1">Invoice details &amp; sources</button>
     <button type="button" role="tab" id="tab-lines" aria-controls="lines-card" aria-selected="false" tabindex="-1">Line items <span class="count" id="count-lines">0</span></button>
-    <button type="button" role="tab" id="tab-events" aria-controls="events-card" aria-selected="false" tabindex="-1">Event log <span class="count" id="count-events">0</span></button>
+    <button type="button" role="tab" id="tab-events" aria-controls="events-card" aria-selected="false" tabindex="-1">Processing history <span class="count" id="count-events">0</span></button>
+    <button type="button" role="tab" id="tab-audit" aria-controls="audit-card" aria-selected="false" tabindex="-1">Audit details</button>
   </div>
-  <div class="tabpanel" role="tabpanel" id="checks-card" aria-labelledby="tab-checks" tabindex="0"><div id="checks"><p class="muted" style="margin:0">Rule checks appear once the decision is recorded.</p></div></div>
-  <div class="tabpanel" role="tabpanel" id="evidence-card" aria-labelledby="tab-evidence" tabindex="0" hidden><div id="evidence"><p class="muted" style="margin:0">Extracted fields and their sources appear once text extraction completes.</p></div></div>
-  <div class="tabpanel" role="tabpanel" id="lines-card" aria-labelledby="tab-lines" tabindex="0" hidden><div id="lines"><p class="muted" style="margin:0">Line items appear once text extraction completes.</p></div></div>
+  <div class="tabpanel" role="tabpanel" id="checks-card" aria-labelledby="tab-checks" tabindex="0"><div id="checks"><p class="muted" style="margin:0">Validation checks appear once the decision is recorded.</p></div></div>
+  <div class="tabpanel" role="tabpanel" id="evidence-card" aria-labelledby="tab-evidence" tabindex="0" hidden><div id="evidence"><p class="muted" style="margin:0">Invoice details and where each value was found appear once the invoice has been read.</p></div></div>
+  <div class="tabpanel" role="tabpanel" id="lines-card" aria-labelledby="tab-lines" tabindex="0" hidden><div id="lines"><p class="muted" style="margin:0">Line items appear once the invoice has been read.</p></div></div>
   <div class="tabpanel" role="tabpanel" id="events-card" aria-labelledby="tab-events" tabindex="0" hidden><div id="events"></div></div>
+  <div class="tabpanel" role="tabpanel" id="audit-card" aria-labelledby="tab-audit" tabindex="0" hidden><div id="audit"></div></div>
 </section>
 {% endblock %}
 {% block scripts %}<script>initRun({{ run_id|tojson }});</script>{% endblock %}
