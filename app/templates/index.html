@@ -1,44 +1,159 @@
 {% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block crumbs %}<span>Invoice Operations</span><span class="sep">/</span><span aria-current="page">Dashboard</span>{% endblock %}
+{% block context %}{% if ws %}<a class="ws-chip" href="/ui/history?workspace_id={{ ws.workspace_id|urlencode }}" title="Active workspace: open its history and ledger">
+  <svg class="icon"><use href="#i-layers"/></svg>Workspace <code>{{ ws.workspace_id }}</code></a>{% endif %}{% endblock %}
 {% block content %}
-<section class="grid2">
-  <div class="card">
-    <h2>1. Procurement data</h2>
-    {% if ws %}
-      <p class="muted">Active workspace <code>{{ ws.workspace_id }}</code>: {{ ws.vendors }} vendor(s), {{ ws.pos }} PO(s), {{ ws.lines }} PO line(s).</p>
-    {% else %}
-      <p class="warn">No procurement data yet. Import the three CSVs first.</p>
-    {% endif %}
-    <form id="import-form">
-      <label>vendors.csv <input type="file" name="vendors" accept=".csv" required></label>
-      <label>purchase_orders.csv <input type="file" name="purchase_orders" accept=".csv" required></label>
-      <label>po_lines.csv <input type="file" name="po_lines" accept=".csv" required></label>
-      <label>Numeric date order (optional)
-        <select name="date_order"><option value="">not set: hold ambiguous dates</option>
-          <option value="MDY">MDY (03/04/2026 = 4 Mar)</option><option value="DMY">DMY (03/04/2026 = 3 Apr)</option></select></label>
-      <label>Default currency (optional)
-        <select name="default_currency"><option value="">not set: hold when none printed</option>
-          <option value="USD">USD</option></select></label>
-      <button type="submit">Import into a new workspace</button>
-    </form>
-    <div id="import-result" class="result"></div>
+<div class="page-head">
+  <div>
+    <h1>Invoice Operations</h1>
+    <p class="lede">Process vendor invoices, validate them against purchase orders, and track every decision.</p>
   </div>
-  <div class="card">
-    <h2>2. Submit an invoice PDF</h2>
-    <form id="upload-form">
-      {% if ws %}
-      <input type="hidden" name="workspace_id" value="{{ ws.workspace_id }}">
-      <p class="muted">Uploads from this page go to workspace <code>{{ ws.workspace_id }}</code>.</p>
-      {% endif %}
-      <label>Invoice PDF <input type="file" name="file" accept="application/pdf,.pdf" required></label>
-      <button type="submit" {% if not ws %}disabled{% endif %}>Upload and process</button>
-    </form>
-    <div id="upload-result" class="result"></div>
+  <div class="page-actions">
+    <button type="button" class="btn btn-secondary" id="open-import"><svg class="icon"><use href="#i-db"/></svg>{{ 'Import new procurement data' if ws else 'Import procurement data' }}</button>
+    <button type="button" class="btn btn-primary" id="focus-upload" {% if not ws %}disabled{% endif %}><svg class="icon"><use href="#i-upload"/></svg>Process an invoice</button>
+  </div>
+</div>
+
+{% if ws %}
+<section class="metrics" id="metrics" data-workspace="{{ ws.workspace_id }}" aria-label="Workspace summary" aria-busy="true">
+  <div class="card metric">
+    <div class="metric-top"><span class="metric-label">Invoice runs</span><span class="metric-icon"><svg class="icon"><use href="#i-receipt"/></svg></span></div>
+    <div class="metric-value" data-m="total"><span class="skeleton" style="width:40px;height:22px"></span></div>
+    <div class="metric-sub" data-m="total-sub">in this workspace</div>
+  </div>
+  <div class="card metric ready">
+    <div class="metric-top"><span class="metric-label">Ready · allocated</span><span class="metric-icon"><svg class="icon"><use href="#i-check-circle"/></svg></span></div>
+    <div class="metric-value" data-m="ready"><span class="skeleton" style="width:40px;height:22px"></span></div>
+    <div class="metric-sub">validated and allocated to a PO</div>
+  </div>
+  <div class="card metric hold">
+    <div class="metric-top"><span class="metric-label">On hold</span><span class="metric-icon"><svg class="icon"><use href="#i-alert"/></svg></span></div>
+    <div class="metric-value" data-m="hold"><span class="skeleton" style="width:40px;height:22px"></span></div>
+    <div class="metric-sub">awaiting AP review</div>
+  </div>
+  <div class="card metric blocked">
+    <div class="metric-top"><span class="metric-label">Blocked or failed</span><span class="metric-icon"><svg class="icon"><use href="#i-block"/></svg></span></div>
+    <div class="metric-value" data-m="blocked"><span class="skeleton" style="width:40px;height:22px"></span></div>
+    <div class="metric-sub" data-m="blocked-sub">duplicates and technical failures</div>
+  </div>
+  <div class="card metric metric-money">
+    <div class="metric-top"><span class="metric-label">PO authorization remaining</span><span class="metric-icon"><svg class="icon"><use href="#i-wallet"/></svg></span></div>
+    <div data-m="money"><div class="metric-value"><span class="skeleton" style="width:140px;height:22px"></span></div></div>
   </div>
 </section>
-<section class="card">
-  <h2>Recent runs{% if ws %} <span class="muted">(workspace {{ ws.workspace_id }} ·
-    <a href="/ui/history?workspace_id={{ ws.workspace_id|urlencode }}">history and ledger</a>)</span>{% endif %}</h2>
-  <div id="recent">Loading…</div>
+{% else %}
+<div class="alert warn" style="margin-bottom:22px">
+  <svg class="icon"><use href="#i-info"/></svg>
+  <div><strong>Start by importing procurement data.</strong> Upload <code>vendors.csv</code>, <code>purchase_orders.csv</code> and
+    <code>po_lines.csv</code> below to create a workspace. Invoices are then validated against that vendor master and those purchase orders.</div>
+</div>
+{% endif %}
+
+<div class="home-grid">
+  <section class="card" id="process" aria-labelledby="process-title">
+    <div class="card-head">
+      <div>
+        <h2 id="process-title"><svg class="icon"><use href="#i-upload"/></svg>Process an invoice</h2>
+        <div class="sub-title">Text extraction (native or OCR), vendor and PO matching, price, authorization and duplicate checks.</div>
+      </div>
+    </div>
+    <div class="card-body">
+      <form id="upload-form" novalidate>
+        {% if ws %}
+        <input type="hidden" name="workspace_id" value="{{ ws.workspace_id }}">
+        {% endif %}
+        <div class="dropzone{% if not ws %} disabled{% endif %}" id="dropzone">
+          <input type="file" id="invoice-file" name="file" accept="application/pdf,.pdf" aria-describedby="dz-hint" {% if not ws %}disabled{% endif %}>
+          <div class="dz-inner" aria-hidden="true">
+            <span class="dz-icon"><svg class="icon"><use href="#i-file"/></svg></span>
+            <span class="dz-title">Drop an invoice PDF here, or <u>browse</u></span>
+            <span class="dz-hint" id="dz-hint">{% if ws %}Scanned or digital PDF · one invoice per upload{% else %}Import procurement data before submitting invoices{% endif %}</span>
+          </div>
+          <label for="invoice-file" class="sr-only">Invoice PDF</label>
+        </div>
+        <div class="file-pill" id="file-pill" hidden>
+          <span class="fi"><svg class="icon"><use href="#i-file"/></svg></span>
+          <div class="meta"><div class="name" id="file-name"></div><div class="size" id="file-size"></div></div>
+          <button type="button" class="btn btn-ghost btn-sm" id="file-clear" aria-label="Remove selected file"><svg class="icon"><use href="#i-x"/></svg></button>
+        </div>
+        <div class="upload-foot">
+          {% if ws %}
+          <p class="form-note"><svg class="icon sm"><use href="#i-layers"/></svg><span>Uploads from this page go to workspace <code>{{ ws.workspace_id }}</code>.</span></p>
+          {% else %}
+          <p class="form-note">No workspace yet.</p>
+          {% endif %}
+          <button type="submit" class="btn btn-primary" id="upload-btn" {% if not ws %}disabled{% endif %}>
+            <svg class="icon"><use href="#i-arrow-right"/></svg><span>Upload and process</span></button>
+        </div>
+      </form>
+      <div id="upload-result" class="result" role="status" aria-live="polite"></div>
+    </div>
+  </section>
+
+  <section class="card" id="procurement" aria-labelledby="proc-title">
+    <div class="card-head">
+      <div>
+        <h2 id="proc-title"><svg class="icon"><use href="#i-db"/></svg>Procurement data</h2>
+        <div class="sub-title">{% if ws %}Vendor master and purchase orders used for validation.{% else %}Required before the first invoice.{% endif %}</div>
+      </div>
+    </div>
+    <div class="card-body">
+      {% if ws %}
+      <div class="stat-trio">
+        <div><b>{{ ws.vendors }}</b><span>vendor{{ '' if ws.vendors == 1 else 's' }}</span></div>
+        <div><b>{{ ws.pos }}</b><span>purchase order{{ '' if ws.pos == 1 else 's' }}</span></div>
+        <div><b>{{ ws.lines }}</b><span>PO line{{ '' if ws.lines == 1 else 's' }}</span></div>
+      </div>
+      <dl class="kv-list" id="ws-settings">
+        <dt>Workspace</dt><dd><code>{{ ws.workspace_id }}</code></dd>
+        <dt>Date order</dt><dd data-s="date_order"><span class="skeleton" style="width:120px"></span></dd>
+        <dt>Default currency</dt><dd data-s="default_currency"><span class="skeleton" style="width:120px"></span></dd>
+      </dl>
+      <hr class="divider">
+      {% endif %}
+      <details class="disclosure" id="import-panel" {% if not ws %}open{% endif %}>
+        <summary><svg class="icon"><use href="#i-plus"/></svg>{{ 'Import into a new workspace' if ws else 'Import procurement CSVs' }}<svg class="icon chev"><use href="#i-chevron"/></svg></summary>
+        <div class="disc-body">
+          <form id="import-form" novalidate>
+            <div class="file-slots">
+              {% for name, file, label in [('vendors', 'vendors.csv', 'Vendor master'), ('purchase_orders', 'purchase_orders.csv', 'PO headers'), ('po_lines', 'po_lines.csv', 'PO lines')] %}
+              <div class="file-slot" data-slot="{{ name }}">
+                <span class="fs-icon"><svg class="icon sm"><use href="#i-file"/></svg></span>
+                <span class="fs-text"><span class="fs-name">{{ file }}</span><span class="fs-state" data-empty="{{ label }} · no file chosen">{{ label }} · no file chosen</span></span>
+                <span class="fs-action">Choose</span>
+                <input type="file" name="{{ name }}" accept=".csv,text/csv" required aria-label="{{ file }} ({{ label }})">
+              </div>
+              {% endfor %}
+            </div>
+            <div class="settings-grid">
+              <label class="field"><span>Numeric date order <small>(optional)</small></span>
+                <select name="date_order"><option value="">Not set: hold ambiguous dates</option>
+                  <option value="MDY">MDY (03/04/2026 = 4 Mar)</option><option value="DMY">DMY (03/04/2026 = 3 Apr)</option></select></label>
+              <label class="field"><span>Default currency <small>(optional)</small></span>
+                <select name="default_currency"><option value="">Not set: hold when none printed</option>
+                  <option value="USD">USD</option></select></label>
+            </div>
+            <p class="hint" style="margin:10px 0 0">Each import creates a new, separate workspace. Earlier workspaces, their runs and ledgers stay unchanged.</p>
+            <div style="margin-top:14px"><button type="submit" class="btn {{ 'btn-secondary' if ws else 'btn-primary' }} btn-block" id="import-btn">
+              <svg class="icon"><use href="#i-db"/></svg><span>Import into a new workspace</span></button></div>
+          </form>
+          <div id="import-result" class="result" role="status" aria-live="polite"></div>
+        </div>
+      </details>
+    </div>
+  </section>
+</div>
+
+<section class="card" aria-labelledby="recent-title">
+  <div class="card-head">
+    <div>
+      <h2 id="recent-title"><svg class="icon"><use href="#i-clock"/></svg>Recent invoices</h2>
+      <div class="sub-title">{% if ws %}Latest runs in this workspace. Updates automatically while invoices are processing.{% else %}Runs appear here once invoices are submitted.{% endif %}</div>
+    </div>
+    {% if ws %}<a class="btn btn-secondary btn-sm" href="/ui/history?workspace_id={{ ws.workspace_id|urlencode }}">History and ledger<svg class="icon"><use href="#i-arrow-right"/></svg></a>{% endif %}
+  </div>
+  <div id="recent" class="card-body flush"><div class="empty"><span class="spinner" style="color:var(--text-3)"></span></div></div>
 </section>
 {% endblock %}
 {% block scripts %}<script>initHome();</script>{% endblock %}
