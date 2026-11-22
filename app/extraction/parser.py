@@ -430,6 +430,22 @@ class InvoiceParser:
             else:
                 if "$" in t.text and not re.search(r"[A-Za-z]\$", t.text):
                     found.append(("$", "dollar", t.text, [t]))
+        # A symbol that is not a recognised marker, printed directly beside an amount ("& 200.00", "&200.00"):
+        # typically a currency sign OCR could not read. It names no currency but blocks the workspace default.
+        for row in self.rows:
+            toks = row.tokens
+            for j, t in enumerate(toks):
+                if any(t in f[3] for f in found):
+                    continue
+                attached = re.fullmatch(r"([^\w\s$().,+\-/%:#'\"]{1,2})\d[\d,]*\.\d{2}", t.text)
+                alone = re.fullmatch(r"[^\w\s$().,+\-/%:#'\"]{1,2}", t.text)
+                if alone:
+                    gap = 1.5 * max(t.h, 1.0)
+                    nb = [toks[k] for k in (j - 1, j + 1) if 0 <= k < len(toks)]
+                    alone = any(re.fullmatch(r"\d[\d,]*\.\d{2}", n.text) and
+                                (0 <= n.x0 - t.x1 <= gap or 0 <= t.x0 - n.x1 <= gap) for n in nb)
+                if attached or alone:
+                    found.append(("?", "unidentified", t.text, [t]))
         return found
 
     def _currency(self, labelled) -> None:
@@ -444,9 +460,10 @@ class InvoiceParser:
              "bbox": evidence_for(toks).bbox} for c, k, text, toks in indicators]
         specific: dict[str, list[tuple[str, str, list[Token]]]] = {}
         for c, k, text, toks in indicators:
-            if c != "$":
+            if c not in ("$", "?"):
                 specific.setdefault(c, []).append((k, text, toks))
         dollars = [(text, toks) for c, k, text, toks in indicators if c == "$"]
+        unidentified = [(text, toks) for c, k, text, toks in indicators if c == "?"]
         default = self.settings.get("default_currency")
         conflict = len(specific) > 1 or (len(specific) == 1 and dollars and next(iter(specific)) not in _DOLLAR_CURRENCIES)
         if conflict:
@@ -469,6 +486,14 @@ class InvoiceParser:
         elif dollars:
             self.inv.currency = Field_(raw="$", value="USD", evidence=evidence_for(dollars[0][1]),
                                        note="inferred from '$' symbol; no ISO code printed")
+        elif unidentified and default:
+            # Something is printed beside the amounts that is not a known currency marker: the default must not
+            # stand in for it. Held for review with the marks as evidence.
+            marks = ", ".join(sorted({f"{text!r} p{toks[0].page}" for text, toks in unidentified}))
+            self.inv.currency = Field_(raw=unidentified[0][0], evidence=evidence_for(unidentified[0][1]),
+                                       note=f"unrecognised mark printed beside amounts ({marks}); it may be a currency "
+                                            f"sign, so the workspace default {default} is not applied")
+            self.inv.issues.append(f"currency: {self.inv.currency.note}")
         elif default:
             # No marker on the document: the workspace's configured default applies, recorded as such.
             self.inv.currency = Field_(value=default, source="workspace_config",

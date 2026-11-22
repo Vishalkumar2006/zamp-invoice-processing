@@ -91,6 +91,16 @@ def test_conflicting_currency_markers_hold_for_review(client, marking):         
             assert "the workspace default USD is not applied" in cur["note"]
 
 
+def test_an_unrecognised_mark_beside_amounts_blocks_the_default(client):
+    # "¤" stands in for any sign the process cannot identify (an unreadable or unlisted currency symbol).
+    run, before, after = _submit(client, make_pdf(items(before="¤ ")), **USD_DEFAULT)
+    _held_untouched(run, before, after)
+    cur = run["extraction"]["invoice"]["currency"]
+    assert cur["value"] is None and cur["source"] is None and cur["raw"] == "¤"
+    assert "the workspace default USD is not applied" in cur["note"]
+    assert {i["kind"] for i in run["extraction"]["invoice"]["currency_indicators"]} == {"unidentified"}
+
+
 def test_unmarked_invoice_uses_the_configured_usd_default(client):                       # 5.
     run, before, after = _submit(client, make_pdf(items()), **USD_DEFAULT)
     assert (run["decision"], after["allocation_count"]) == ("READY", 1)
