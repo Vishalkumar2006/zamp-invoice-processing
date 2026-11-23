@@ -1,12 +1,12 @@
 {% extends "base.html" %}
 {% block title %}Invoice details{% endblock %}
 {% block crumbs %}<a href="/">Dashboard</a><span class="sep">/</span><a href="/ui/history?workspace_id={{ workspace_id|urlencode }}">History</a><span class="sep">/</span><span aria-current="page" id="crumb-current">{{ run_id }}</span>{% endblock %}
-{% block context %}<a class="ws-chip" href="/ui/history?workspace_id={{ workspace_id|urlencode }}" title="History and ledger for this run's workspace">
-  <svg class="icon"><use href="#i-layers"/></svg>Workspace <code>{{ workspace_id }}</code></a>{% endblock %}
+{% block context %}<a class="ws-chip" href="/ui/history?workspace_id={{ workspace_id|urlencode }}" title="History and ledger for the procurement data this invoice was checked against">
+  <svg class="icon"><use href="#i-layers"/></svg>Procurement data<strong class="ws-import-label" hidden></strong></a>{% endblock %}
 {% block sidebar_ws %}
         <div class="ws-card">
-          <span class="ws-card-label"><svg class="icon sm"><use href="#i-layers"/></svg>Invoice workspace</span>
-          <code class="ws-card-id">{{ workspace_id }}</code>
+          <span class="ws-card-label"><svg class="icon sm"><use href="#i-layers"/></svg>Checked against</span>
+          <span class="ws-card-value ws-import-name">Procurement data</span>
           <a class="ws-card-link" href="/ui/history?workspace_id={{ workspace_id|urlencode }}">View history &amp; ledger</a>
         </div>{% endblock %}
 {% block content %}
@@ -17,7 +17,7 @@
       <span id="meta-file"><svg class="icon"><use href="#i-file"/></svg><span class="skeleton" style="width:160px"></span></span>
       <span title="Reference for this processing attempt"><svg class="icon"><use href="#i-receipt"/></svg>Processing reference <code>{{ run_id }}</code></span>
       <span id="meta-po" hidden></span>
-      <a href="/ui/history?workspace_id={{ workspace_id|urlencode }}"><svg class="icon"><use href="#i-ledger"/></svg>History &amp; ledger for workspace <code>{{ workspace_id }}</code></a>
+      <a href="/ui/history?workspace_id={{ workspace_id|urlencode }}"><svg class="icon"><use href="#i-ledger"/></svg>History &amp; ledger for this procurement data</a>
     </div>
   </div>
   <div class="run-status">

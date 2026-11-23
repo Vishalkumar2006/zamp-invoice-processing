@@ -148,3 +148,44 @@ def test_run_page_keeps_audit_detail_available(client):
     for needed in ("Rules policy version", "Reason codes", "File fingerprint (SHA-256)", "renderCandidates", "renderPrices",
                    "renderDuplicate", "renderRemittance", "renderAuthorization", "Show full reason"):
         assert needed in js, needed
+
+
+def _options(page):
+    return [(v, " ".join(t.split())) for v, t in re.findall(r'<option value="([^"]+)"[^>]*>(.*?)</option>', page, re.S)]
+
+
+def test_procurement_data_selector_uses_import_labels_not_ids(client):
+    import sqlite3
+
+    from app import config
+    old = _import(client)
+    run_old = _run(client, old, invoice_pdf())
+    new = _import(client)
+    # Simulate imports on different days (test database only).
+    with sqlite3.connect(config.DB_PATH) as c:
+        c.execute("UPDATE workspaces SET created_at=? WHERE id=?", ("2026-11-20T09:15:00.000+00:00", old))
+        c.execute("UPDATE workspaces SET created_at=? WHERE id=?", ("2026-11-22T10:00:00.000+00:00", new))
+    page = client.get("/ui/history", params={"workspace_id": old}).text
+    assert '<label for="ws-select">Procurement data</label>' in page
+    assert _options(page) == [(new, "Latest import · 22 Nov 2026 · no invoices yet"), (old, "Imported 20 Nov 2026 · 1 invoice")]
+    assert re.search(rf'<option value="{old}" selected>', page)  # switching still targets the internal workspace
+    assert run_old["run_id"] in page
+    assert run_old["run_id"] not in client.get("/ui/history", params={"workspace_id": new}).text
+    chip = re.search(r'<span class="ws-chip">(.*?)</span>', page, re.S).group(1)
+    assert "Imported 20 Nov 2026" in chip and old not in chip
+
+    # Two imports on the same day are told apart by their time (UTC).
+    with sqlite3.connect(config.DB_PATH) as c:
+        c.execute("UPDATE workspaces SET created_at=? WHERE id=?", ("2026-11-22T08:05:00.000+00:00", old))
+    page = client.get("/ui/history", params={"workspace_id": new}).text
+    assert _options(page) == [(new, "Latest import · 22 Nov 2026, 10:00 UTC · no invoices yet"),
+                              (old, "Imported 22 Nov 2026, 08:05 UTC · 1 invoice")]
+
+
+def test_dashboard_names_the_latest_import_without_showing_ids(client):
+    ws = _import(client)
+    page = client.get("/").text
+    visible = re.sub(r"<[^>]+>", " ", re.sub(r"<(script|svg)\b.*?</\1>", " ", page, flags=re.S))
+    assert ws not in visible
+    assert "Procurement data" in visible and "Latest import" in visible
+    assert f'<input type="hidden" name="workspace_id" value="{ws}">' in page  # uploads stay bound to this import

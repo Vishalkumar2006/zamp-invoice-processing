@@ -97,6 +97,9 @@ p { margin: 0 0 8px; }
 .ws-card-label .icon { color: #7ea3ff; }
 .ws-card-id { color: #e6ebf5; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
 .ws-card-empty { color: #d4dbea; font-size: 12.5px; }
+.ws-card-value { color: #fff; font-size: 13.5px; font-weight: 650; margin-top: 2px; }
+.ws-card-ref { font-size: 11px; color: var(--nav-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ws-card-ref code { color: var(--nav-muted); font-size: 10.5px; }
 .ws-card-note { color: var(--nav-text); }
 .ws-card-link { color: #9db8ff; font-weight: 600; margin-top: 4px; }
 .ws-card-link:hover { color: #c3d3ff; }
@@ -613,3 +616,7 @@ h2 .muted { font-weight: 500; font-size: 13px; }
 .link-btn[aria-expanded="true"] .icon { transform: rotate(180deg); }
 .rule-label { font-weight: 600; color: var(--text-2); white-space: nowrap; font-size: 12.5px; }
 .facts dt { overflow-wrap: break-word; }
+
+/* The ledger heading keeps its workspace reference for assistive technology only; the selector names the data set. */
+#ledger-title > .muted { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.ws-chip strong { font-weight: 650; color: var(--text); }

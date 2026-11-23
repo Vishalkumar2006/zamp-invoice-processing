@@ -136,7 +136,7 @@ function initImport() {
       const notes = [st.date_order ? `numeric dates read as ${st.date_order === "MDY" ? "month/day/year" : "day/month/year"}` : "",
         st.default_currency ? `${st.default_currency} used when no currency is printed` : ""].filter(Boolean).join("; ");
       setHTML(out, alertBox("ok", "check-circle", `<strong>Procurement data loaded</strong>: ${esc(body.vendors)} vendors,
-        ${esc(body.purchase_orders)} purchase orders, ${esc(body.po_lines)} PO lines${notes ? ` (${esc(notes)})` : ""}. Opening the new workspace…`));
+        ${esc(body.purchase_orders)} purchase orders, ${esc(body.po_lines)} PO lines${notes ? ` (${esc(notes)})` : ""}. Switching to the new import…`));
       setTimeout(() => location.reload(), 900);
     } else {
       const errs = (body && body.errors) || [body && body.detail ? String(body.detail) : (res.status ? `The server returned status ${res.status}.` : "The connection failed. Please try again.")];
@@ -230,14 +230,14 @@ async function loadMetrics(ws) {
   const busy = (n.RUNNING || 0) + (n.QUEUED || 0);
   const set = (k, html) => setHTML(box.querySelector(`[data-m="${k}"]`), html);
   set("total", String(runs.runs.length));
-  set("total-sub", busy ? `<strong>${busy}</strong> processing now` : "in this workspace");
+  set("total-sub", busy ? `<strong>${busy}</strong> processing now` : "for the latest import");
   set("ready", String(n.READY || 0));
   set("hold", String(n.HOLD || 0));
   set("blocked", String((n.BLOCKED || 0) + (n.FAILED || 0)));
   set("blocked-sub", `<strong>${n.BLOCKED || 0}</strong> blocked · <strong>${n.FAILED || 0}</strong> failed`);
   const groups = groupLedger(ledger.purchase_orders);
   let html;
-  if (!groups.length) html = `<div class="metric-value">—</div><div class="metric-sub">No purchase orders in this workspace</div>`;
+  if (!groups.length) html = `<div class="metric-value">—</div><div class="metric-sub">No purchase orders in this procurement data</div>`;
   else if (groups.length === 1) {
     const g = groups[0];
     const pct = g.auth ? Math.min(100, (100 * g.alloc) / g.auth) : 0;
@@ -829,7 +829,7 @@ function renderAudit(run) {
   const ts = (v) => (v ? `${esc(v.replace("T", " ").slice(0, 23))} UTC` : "—");
   const rows = [
     ["Processing reference", `<code>${esc(run.run_id)}</code>`],
-    ["Workspace", `<code>${esc(run.workspace_id)}</code>`],
+    ["Procurement data reference (workspace ID)", `<code>${esc(run.workspace_id)}</code>`],
     ["Outcome", run.decision ? `${esc(run.decision)}` : esc(run.status)],
     ["Reason codes", d ? [d.reason_code, ...(d.reason_codes || []).filter((c) => c !== d.reason_code)].map((c) => `<code>${esc(c)}</code>`).join(", ") : "—"],
     ["Rules policy version", d ? `<code>${esc(d.policy_version)}</code>` : (run.policy_version ? `<code>${esc(run.policy_version)}</code>` : "—")],
@@ -1014,8 +1014,21 @@ function initTabs() {
   });
 }
 
+// Name the procurement data a run was checked against: the latest import, or an earlier one (via the existing /procurement).
+async function labelImport(workspaceId) {
+  try {
+    const latest = await getJSON("/procurement");
+    const name = latest.workspace_id === workspaceId ? "Latest import" : "Earlier import";
+    document.querySelectorAll(".ws-import-label").forEach((el) => { el.textContent = ` · ${name}`; el.hidden = false; });
+    document.querySelectorAll(".ws-import-name").forEach((el) => { el.textContent = name; });
+  } catch (err) {
+    console.error(err);
+  }
+}
+
 function initRun(runId) {
   initTabs();
+  let labelled = false;
   let timer = null;
   let busy = false;
   const tick = async () => {
@@ -1024,6 +1037,7 @@ function initRun(runId) {
     try {
       const run = await getJSON(`/runs/${enc(runId)}`);
       renderRun(run);
+      if (!labelled) { labelled = true; labelImport(run.workspace_id); }
       if (FINAL.has(run.status)) clearInterval(timer);
     } catch (err) {
       console.error(err);

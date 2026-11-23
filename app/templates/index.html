@@ -1,12 +1,12 @@
 {% extends "base.html" %}
 {% block title %}Dashboard{% endblock %}
 {% block crumbs %}<span>Invoice Operations</span><span class="sep">/</span><span aria-current="page">Dashboard</span>{% endblock %}
-{% block context %}{% if ws %}<a class="ws-chip" href="/ui/history?workspace_id={{ ws.workspace_id|urlencode }}" title="Active workspace: open its history and ledger">
-  <svg class="icon"><use href="#i-layers"/></svg>Workspace <code>{{ ws.workspace_id }}</code></a>{% endif %}{% endblock %}
+{% block context %}{% if ws %}<a class="ws-chip" href="/ui/history?workspace_id={{ ws.workspace_id|urlencode }}" title="Open the history and ledger for this procurement data">
+  <svg class="icon"><use href="#i-layers"/></svg>Procurement data · <strong>Latest import</strong></a>{% endif %}{% endblock %}
 {% block sidebar_ws %}{% if ws %}
         <div class="ws-card">
-          <span class="ws-card-label"><svg class="icon sm"><use href="#i-layers"/></svg>Current workspace</span>
-          <code class="ws-card-id">{{ ws.workspace_id }}</code>
+          <span class="ws-card-label"><svg class="icon sm"><use href="#i-layers"/></svg>Procurement data</span>
+          <span class="ws-card-value">Latest import</span>
           <span class="ws-card-note">{{ ws.vendors }} vendor{{ '' if ws.vendors == 1 else 's' }} · {{ ws.pos }} purchase order{{ '' if ws.pos == 1 else 's' }}</span>
           <a class="ws-card-link" href="/ui/history?workspace_id={{ ws.workspace_id|urlencode }}">View history &amp; ledger</a>
         </div>{% else %}{{ super() }}{% endif %}{% endblock %}
@@ -27,7 +27,7 @@
   <div class="card metric">
     <div class="metric-top"><span class="metric-label">Invoices submitted</span><span class="metric-icon"><svg class="icon"><use href="#i-receipt"/></svg></span></div>
     <div class="metric-value" data-m="total"><span class="skeleton" style="width:40px;height:22px"></span></div>
-    <div class="metric-sub" data-m="total-sub">in this workspace</div>
+    <div class="metric-sub" data-m="total-sub">for the latest import</div>
   </div>
   <div class="card metric ready">
     <div class="metric-top"><span class="metric-label">Ready</span><span class="metric-icon"><svg class="icon"><use href="#i-check-circle"/></svg></span></div>
@@ -86,7 +86,7 @@
         </div>
         <div class="upload-foot">
           {% if ws %}
-          <p class="form-note"><svg class="icon sm"><use href="#i-layers"/></svg><span>Uploads from this page go to workspace <code>{{ ws.workspace_id }}</code>.</span></p>
+          <p class="form-note"><svg class="icon sm"><use href="#i-layers"/></svg><span>Uploads from this page go to workspace <strong>Latest import</strong> (the procurement data shown on this page).</span></p>
           {% else %}
           <p class="form-note">Procurement data is required first.</p>
           {% endif %}
@@ -113,7 +113,7 @@
         <div><b>{{ ws.lines }}</b><span>PO line{{ '' if ws.lines == 1 else 's' }}</span></div>
       </div>
       <dl class="kv-list" id="ws-settings">
-        <dt>Workspace</dt><dd><code>{{ ws.workspace_id }}</code></dd>
+        <dt>In use</dt><dd>Latest import</dd>
         <dt>Numeric dates</dt><dd data-s="date_order"><span class="skeleton" style="width:120px"></span></dd>
         <dt>Default currency</dt><dd data-s="default_currency"><span class="skeleton" style="width:120px"></span></dd>
       </dl>
@@ -141,7 +141,7 @@
                 <select name="default_currency"><option value="">Not set: send for review</option>
                   <option value="USD">USD</option></select></label>
             </div>
-            <p class="hint" style="margin:10px 0 0">Each upload creates a new, separate workspace. Earlier workspaces keep their invoices and PO ledgers unchanged.</p>
+            <p class="hint" style="margin:10px 0 0">Each upload is kept as a separate import. Earlier imports keep their invoices and PO ledgers unchanged, and remain available in History &amp; Ledger.</p>
             <div style="margin-top:14px"><button type="submit" class="btn {{ 'btn-secondary' if ws else 'btn-primary' }} btn-block" id="import-btn">
               <svg class="icon"><use href="#i-db"/></svg><span>Set up procurement data</span></button></div>
           </form>
@@ -156,7 +156,7 @@
   <div class="card-head">
     <div>
       <h2 id="recent-title"><svg class="icon"><use href="#i-clock"/></svg>Recent invoices</h2>
-      <div class="sub-title">{% if ws %}Latest invoices in this workspace. Updates automatically while invoices are processing.{% else %}Invoices appear here once submitted.{% endif %}</div>
+      <div class="sub-title">{% if ws %}Latest invoices for this procurement data. Updates automatically while invoices are processing.{% else %}Invoices appear here once submitted.{% endif %}</div>
     </div>
     {% if ws %}<a class="btn btn-secondary btn-sm" href="/ui/history?workspace_id={{ ws.workspace_id|urlencode }}">History and ledger<svg class="icon"><use href="#i-arrow-right"/></svg></a>{% endif %}
   </div>

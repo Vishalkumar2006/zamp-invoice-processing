@@ -1,7 +1,23 @@
 {% extends "base.html" %}
 {% block title %}History & Ledger{% endblock %}
 {% block crumbs %}<a href="/">Invoice Operations</a><span class="sep">/</span><span aria-current="page">History &amp; Ledger</span>{% endblock %}
-{% block context %}{% if workspace_id %}<span class="ws-chip"><svg class="icon"><use href="#i-layers"/></svg>Workspace <code>{{ workspace_id }}</code></span>{% endif %}{% endblock %}
+{% block context %}{% if workspace_id %}{% set cur = workspaces|selectattr('workspace_id', 'equalto', workspace_id)|first %}<span class="ws-chip"><svg class="icon"><use href="#i-layers"/></svg>Procurement data ·
+  <strong>{{ 'Latest import' if workspace_id == latest_workspace_id else 'Imported ' ~ import_when(cur) }}</strong></span>{% endif %}{% endblock %}
+{#- Customer-facing name of a procurement data import, built from its real import time and invoice count. -#}
+{% macro import_date(iso) -%}
+  {%- set months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'] -%}
+  {{ iso[8:10]|int }} {{ months[iso[5:7]|int - 1] }} {{ iso[:4] }}
+{%- endmacro %}
+{% macro import_when(w) -%}
+  {#- Add the time (UTC) only when another import shares the same date, so every label stays distinct. -#}
+  {%- set ns = namespace(n=0) -%}
+  {%- for o in workspaces if o.created_at[:10] == w.created_at[:10] %}{% set ns.n = ns.n + 1 %}{% endfor -%}
+  {{ import_date(w.created_at) }}{% if ns.n > 1 %}, {{ w.created_at[11:16] }} UTC{% endif %}
+{%- endmacro %}
+{% macro invoice_count(n) -%}{{ 'no invoices yet' if n == 0 else ('1 invoice' if n == 1 else n ~ ' invoices') }}{%- endmacro %}
+{% macro import_label(w) -%}
+  {{ 'Latest import · ' if w.workspace_id == latest_workspace_id else 'Imported ' }}{{ import_when(w) }} · {{ invoice_count(w.runs) }}
+{%- endmacro %}
 {% macro reason_label(code) -%}
   {%- for w in code.split('_') -%}
     {%- if w in ('PO', 'POS', 'ID', 'SKU') -%}{{ 'POs' if w == 'POS' else w }}{%- elif loop.first -%}{{ w|lower|capitalize }}{%- else -%}{{ w|lower }}{%- endif -%}
@@ -9,11 +25,12 @@
   {%- endfor -%}
 {%- endmacro %}
 {% block sidebar_ws %}{% if workspace_id %}
+        {%- set cur = workspaces|selectattr('workspace_id', 'equalto', workspace_id)|first %}
         <div class="ws-card">
-          <span class="ws-card-label"><svg class="icon sm"><use href="#i-layers"/></svg>Viewing workspace</span>
-          <code class="ws-card-id">{{ workspace_id }}</code>
-          {%- for w in workspaces if w.workspace_id == workspace_id %}
-          <span class="ws-card-note">Data loaded {{ w.created_at[:10] }}</span>{% endfor %}
+          <span class="ws-card-label"><svg class="icon sm"><use href="#i-layers"/></svg>Procurement data</span>
+          <span class="ws-card-value">{{ 'Latest import' if workspace_id == latest_workspace_id else 'Earlier import' }}</span>
+          <span class="ws-card-note">{{ import_when(cur) }} · {{ invoice_count(cur.runs) }}</span>
+          <span class="ws-card-ref" title="Internal reference for support">Ref. <code id="current-ws">{{ workspace_id }}</code></span>
           <a class="ws-card-link" href="/">Back to dashboard</a>
         </div>{% else %}{{ super() }}{% endif %}{% endblock %}
 {% block content %}
@@ -22,19 +39,18 @@
   <div>
     <h1>History &amp; Ledger</h1>
     {% if workspace_id %}
-    <p class="lede">Every submitted invoice and purchase order allocation in workspace <code id="current-ws">{{ workspace_id }}</code>
-      {%- if workspace_id == latest_workspace_id %} <span class="tag">latest</span>{% endif %}</p>
+    <p class="lede">Every submitted invoice and purchase order allocation for the selected procurement data.</p>
     {% else %}
-    <p class="lede">Submitted invoices and purchase order allocations, per workspace.</p>
+    <p class="lede">Submitted invoices and purchase order allocations for each procurement data import.</p>
     {% endif %}
   </div>
   {% if workspaces %}
   <form id="ws-form" class="wsform" method="get" action="/ui/history">
-    <label for="ws-select">Workspace</label>
+    <label for="ws-select">Procurement data</label>
     <select name="workspace_id" id="ws-select" onchange="this.form.submit()">
       {% for w in workspaces %}
       <option value="{{ w.workspace_id }}" {% if w.workspace_id == workspace_id %}selected{% endif %}>
-        {{ w.workspace_id }} · loaded {{ w.created_at[:16].replace('T', ' ') }} UTC · {{ w.runs }} invoice{{ '' if w.runs == 1 else 's' }}{% if loop.first %} · latest{% endif %}
+        {{ import_label(w) }}
       </option>
       {% endfor %}
     </select>
@@ -58,7 +74,7 @@
   <div class="card metric">
     <div class="metric-top"><span class="metric-label">Invoices submitted</span><span class="metric-icon"><svg class="icon"><use href="#i-receipt"/></svg></span></div>
     <div class="metric-value">{{ runs|length }}</div>
-    <div class="metric-sub">{% if processing %}{{ processing }} still processing{% else %}in this workspace{% endif %}</div>
+    <div class="metric-sub">{% if processing %}{{ processing }} still processing{% else %}for this procurement data{% endif %}</div>
   </div>
   <div class="card metric ready">
     <div class="metric-top"><span class="metric-label">Ready</span><span class="metric-icon"><svg class="icon"><use href="#i-check-circle"/></svg></span></div>
@@ -155,7 +171,7 @@
       {% else %}
         <tr><td colspan="9"><div class="empty">
           <span class="empty-icon"><svg class="icon lg"><use href="#i-receipt"/></svg></span>
-          <h3>No invoices in this workspace yet</h3>
+          <h3>No invoices for this procurement data yet</h3>
           <p>Submit an invoice PDF from the dashboard. Its decision and any allocation are listed here.</p>
         </div></td></tr>
       {% endfor %}
